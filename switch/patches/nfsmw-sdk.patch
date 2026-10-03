@@ -1,0 +1,985 @@
+diff --git a/sdk/include/rex/graphics/command_processor.h b/sdk/include/rex/graphics/command_processor.h
+index da8e432..53eb878 100644
+--- a/sdk/include/rex/graphics/command_processor.h
++++ b/sdk/include/rex/graphics/command_processor.h
+@@ -254,6 +254,10 @@ class CommandProcessor {
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
++  // Torchlight : réinitialisation de l'anneau demandée par le thread du jeu (InitializeRingBuffer), appliquée par le
++  // thread du GPU (seul à écrire read_ptr_index_). Sans cela, une réinitialisation pendant ExecutePrimaryBuffer était
++  // écrasée par l'ancienne position de lecture : interblocage au démarrage, au hasard (fence jamais exécutée).
++  std::atomic<bool> ring_reset_pending_{false};
+ 
+   // Some titles submit writes beyond the emulated register file range in PM4
+   // packets. Preserve these values so dependent packet logic can still observe
+diff --git a/sdk/include/rex/ui/presenter.h b/sdk/include/rex/ui/presenter.h
+index d703d34..c89f546 100644
+--- a/sdk/include/rex/ui/presenter.h
++++ b/sdk/include/rex/ui/presenter.h
+@@ -374,6 +374,14 @@ class Presenter {
+   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
+                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
++  // Torchlight (rendu natif) : l'application fournit elle-même l'image du jeu. Tant que le drapeau
++  // est posé, RefreshGuestOutput (appelé par l'émulation à chaque Swap) ne fait rien ; seul
++  // RefreshGuestOutputFromApp met l'image à jour.
++  void SetGuestOutputFromApp(bool from_app) { guest_output_from_app_.store(from_app); }
++  bool IsGuestOutputFromApp() const { return guest_output_from_app_.load(); }
++  bool RefreshGuestOutputFromApp(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
++                                 uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
++                                 std::function<bool(GuestOutputRefreshContext& context)> refresher);
+   // The implementation must be callable from any thread, including from
+   // multiple at the same time, and it should acquire the latest guest output
+   // image via ConsumeGuestOutput.
+@@ -713,6 +721,14 @@ class Presenter {
+       uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;
+ 
++ private:
++  bool RefreshGuestOutputCommon(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
++                                uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
++                                std::function<bool(GuestOutputRefreshContext& context)> refresher);
++  std::atomic<bool> guest_output_from_app_{false};
++
++ protected:
++
+   // For guest output capturing (for debugging use thus - shouldn't be adding
+   // any noise like dithering that's not present in the original image),
+   // converting a 10bpc RGB pixel to 8bpc that can be stored in common image
+diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
+index 34cd4ed..7ffed2b 100644
+--- a/sdk/src/core/guest_memory_switch.cpp
++++ b/sdk/src/core/guest_memory_switch.cpp
+@@ -2,6 +2,7 @@
+ 
+ #if defined(__SWITCH__)
+ 
++#include <algorithm>
+ #include "guest_memory_switch.h"
+ 
+ #include <malloc.h>
+@@ -22,6 +23,24 @@ constexpr size_t kPageSize  = 0x1000;
+  * page table.
+  */
+ constexpr size_t kBlockSize = 0x200000;
++/*
++ * Smallest commit (Torchlight): each chunk costs the kernel a code alias plus one
++ * mapping per view, and a game that commits its physical memory 4 KB at a time
++ * runs out of kernel memory blocks (0xCE01, OutOfResource) with only ~300 MB
++ * committed. Rounding commits to 64 KB divides the number of chunks by up to 16.
++ * The extra pages are committed zeroed, which the guest cannot tell apart.
++ *
++ * 64 KB was still not enough: Torchlight's physical heap hands out small blocks
++ * (8 to 160 KB) one after another, top down, and each one became its own chunk.
++ * On another console the game hit 0xCE01 again after a town -> mine -> town trip,
++ * with 1,135 chunks for 395 MB (left part of the town black, then the whole console
++ * hung: the kernel memory blocks may be shared with the system). Committing whole
++ * 2 MB blocks puts those neighbours in a single chunk (at most 256 for the 512 MB
++ * of the 360) and lets the kernel use block descriptors. The cost is at most 2 MB
++ * per committed run, and a chunk only partly decommitted stays committed, which
++ * the 512 MB of guest physical memory bounds.
++ */
++constexpr size_t kCommitGranule = kBlockSize;
+ 
+ constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
+ constexpr size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
+@@ -423,6 +442,18 @@ size_t RexGmCommittedBytes(void) {
+     return s.committed;
+ }
+ 
++size_t RexGmChunkCount(void) {
++    State& s = S();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    return s.chunks.size();
++}
++
++size_t RexGmProtectedPages(void) {
++    State& s = S();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    return s.protection.size();
++}
++
+ size_t RexGmMappedBytes(void) {
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+@@ -478,8 +509,8 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (!s.base) return false;
+ 
+-    const size_t begin = AlignDown(offset, kPageSize);
+-    const size_t end   = AlignUp(offset + length, kPageSize);
++    const size_t begin = AlignDown(offset, kCommitGranule);
++    const size_t end   = std::min(AlignUp(offset + length, kCommitGranule), s.size);
+ 
+     size_t cur = begin;
+     while (cur < end) {
+diff --git a/sdk/src/core/guest_memory_switch.h b/sdk/src/core/guest_memory_switch.h
+index 3c9501e..0fddb89 100644
+--- a/sdk/src/core/guest_memory_switch.h
++++ b/sdk/src/core/guest_memory_switch.h
+@@ -167,6 +167,11 @@ size_t RexGmCommittedBytes(void);
+  */
+ size_t RexGmMappedBytes(void);
+ 
++/* Number of committed chunks and of pages with logical protection (unmapped for
++ * write watching). Each one costs kernel memory blocks. For diagnostics. */
++size_t RexGmChunkCount(void);
++size_t RexGmProtectedPages(void);
++
+ /*
+  * Tells whether watched pages are protected with permissions (readable) or by
+  * unmapping (not readable). It is printed in the profile header to show which
+diff --git a/sdk/src/core/memory_switch.cpp b/sdk/src/core/memory_switch.cpp
+index da1643f..a13f00c 100644
+--- a/sdk/src/core/memory_switch.cpp
++++ b/sdk/src/core/memory_switch.cpp
+@@ -160,9 +160,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+     // (switch_perf.cpp); switch.h cannot be included here without clashing with
+     // the SDK types.
+     REXLOG_ERROR("AllocFixed: no se pudo confirmar 0x{:X} bytes en 0x{:016X}. Fallo 0x{:08X}; "
+-                 "respaldo {} MB, mapeado {} MB contando espejos.",
++                 "respaldo {} MB, mapeado {} MB contando espejos; {} trozos, {} paginas protegidas.",
+                  length, reinterpret_cast<uintptr_t>(base_address), RexGmLastResult(),
+-                 RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20);
++                 RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20, RexGmChunkCount(),
++                 RexGmProtectedPages());
+     return nullptr;
+   }
+ 
+diff --git a/sdk/src/filesystem/devices/host_path_entry.cpp b/sdk/src/filesystem/devices/host_path_entry.cpp
+index 8b903f0..7f21f78 100644
+--- a/sdk/src/filesystem/devices/host_path_entry.cpp
++++ b/sdk/src/filesystem/devices/host_path_entry.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdio>
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
+@@ -138,6 +139,36 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
+   }
+ }
+ 
++// Torchlight : la Switch refuse de renommer un fichier encore ouvert, ce que les jeux Xbox font (renommage par
++// NtSetInformationFile sur le handle ouvert : Torchlight écrit save.tmp puis le renomme en 0.tsv). Repli : copie du
++// contenu vers le nouveau nom (l'écriture est finie quand le jeu renomme), puis suppression de l'ancien si possible.
++static bool CopyInsteadOfRename(const std::filesystem::path& from, const std::filesystem::path& to) {
++  std::error_code ec;
++  if (std::filesystem::is_directory(from, ec)) return false;
++  FILE* in = std::fopen(rex::path_to_utf8(from).c_str(), "rb");
++  if (!in) return false;
++  FILE* out = std::fopen(rex::path_to_utf8(to).c_str(), "wb");
++  if (!out) {
++    std::fclose(in);
++    return false;
++  }
++  char buf[65536];
++  size_t n;
++  bool ok = true;
++  while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) ok = ok && std::fwrite(buf, 1, n, out) == n;
++  ok = ok && !std::ferror(in);
++  std::fclose(in);
++  ok = std::fclose(out) == 0 && ok;
++  if (!ok) {
++    std::remove(rex::path_to_utf8(to).c_str());
++    return false;
++  }
++  std::remove(rex::path_to_utf8(from).c_str());  // échoue si encore ouvert : sans conséquence
++  REXFS_WARN("RenameEntryInternal: '{}' copié vers '{}' (renommage refusé, fichier ouvert ?)",
++             rex::path_to_utf8(from), rex::path_to_utf8(to));
++  return true;
++}
++
+ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& path_parts) {
+   auto new_host_path = static_cast<HostPathDevice*>(device_)->host_path();
+   for (const auto& path_part : path_parts) {
+@@ -146,7 +177,7 @@ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>&
+ 
+   std::error_code ec;
+   std::filesystem::rename(host_path_, new_host_path, ec);
+-  if (ec) {
++  if (ec && !CopyInsteadOfRename(host_path_, new_host_path)) {
+     REXFS_ERROR("RenameEntryInternal: failed to rename '{}' to '{}': {}",
+                 rex::path_to_utf8(host_path_), rex::path_to_utf8(new_host_path), ec.message());
+     return X_STATUS_ACCESS_DENIED;
+diff --git a/sdk/src/filesystem/devices/host_path_file.cpp b/sdk/src/filesystem/devices/host_path_file.cpp
+index 15e12ce..8b03061 100644
+--- a/sdk/src/filesystem/devices/host_path_file.cpp
++++ b/sdk/src/filesystem/devices/host_path_file.cpp
+@@ -113,6 +113,17 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
+                      "Cache en RAM de lo ya leido del disco, en MB (0 = apagada). Solo datos de solo "
+                      "lectura. El juego relee cada vuelta lo mismo.");
+ 
++/*
++ * Block size of that cache, in KB (torchlight, 2026-10-02). 256 keeps the NFSMW behaviour above. Torchlight
++ * reads everything from a single 140 MB pak.zip in tiny scattered pieces (median 46 bytes, 32 KB at most,
++ * 50,592 reads to reach the mines): the 256 KB window refilled 601 times and read 157 MB from the SD for
++ * 27.7 MB asked (15.6 MB distinct). Simulated on that trace, 64 KB blocks with a 32 MB LRU read 20.8 MB in
++ * 317 calls (~1.1 s on the console instead of ~6.9 s). Torchlight sets 64 in its torchlight.toml, with the
++ * window off (it comes first and would keep refilling).
++ */
++REXCVAR_DEFINE_INT32(nfsmw_io_cache_bloque_kb, 256, "Filesystem",
++                     "Tamano de bloque de la cache en RAM (nfsmw_io_cache_mb), en KB.");
++
+ /*
+  * Read cache by exact range. This is the second attempt, not the block cache above.
+  *
+@@ -197,11 +208,15 @@ std::atomic<int64_t> g_ventanas_vivas{0};
+ // Above this it does not pay off: the request is already large and the window would only add an extra copy.
+ constexpr size_t kPeticionMaxFraccion = 4;  // pedido <= ventana/4
+ 
+-/* The read cache (see nfsmw_io_cache_mb). */
+-constexpr size_t kBloqueCache = 256 * 1024;
++/* The read cache (see nfsmw_io_cache_mb, nfsmw_io_cache_bloque_kb). Read once: the cvars are loaded before
++ * the first file read. */
++size_t TamBloque() {
++  static const size_t tam = static_cast<size_t>(std::clamp(REXCVAR_GET(nfsmw_io_cache_bloque_kb), 4, 4096)) * 1024u;
++  return tam;
++}
+ 
+ struct BloqueCache {
+-  std::vector<uint8_t> datos;  // may be shorter than kBloqueCache at end of file
++  std::vector<uint8_t> datos;  // may be shorter than a block at end of file
+   uint64_t uso = 0;            // for the LRU
+ };
+ 
+@@ -251,120 +266,151 @@ void PodarCache(size_t limite) {
+ }
+ 
+ /*
+- * Serves the read from RAM, bringing from disk only the missing blocks (grouped, one pread per
+- * contiguous range). Returns false if it cannot: then the usual path answers and nothing that
+- * matters has been touched.
++ * Serves the read from RAM, bringing from disk the missing part in a single pread. Returns false if it
++ * cannot: then the usual path answers (it reads the whole request again, so nothing copied so far matters).
++ *
++ * torchlight, 2026-10-02: the lock is no longer held during the disk read (the flaw that made NFSMW drop
++ * this cache: any other reading thread, the music one here, waited behind it). Under the lock: the blocks
++ * already present are copied; at the first missing one the lock is released, the rest of the request
++ * (from that block to the last one) is read in one go, then the lock is taken again to store the blocks
++ * that are still missing. The bytes are copied from the read buffer itself, never looked up again: another
++ * thread may have evicted them in between.
+  */
+ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t byte_offset,
+                   size_t* out_bytes_read) {
+   const size_t limite = static_cast<size_t>(REXCVAR_GET(nfsmw_io_cache_mb)) * 1024u * 1024u;
+   const size_t pedido = buffer.size();
+-  if (!limite || !pedido || !id || g_cache_sin_memoria) {
++  const size_t bloque = TamBloque();
++  if (!limite || !pedido || !id) {
+     return false;
+   }
+-  const uint64_t primero = byte_offset / kBloqueCache;
+-  const uint64_t ultimo = (byte_offset + pedido - 1) / kBloqueCache;
++  const uint64_t primero = byte_offset / bloque;
++  const uint64_t ultimo = (byte_offset + pedido - 1) / bloque;
+   // A request larger than half the cache would fill it on its own and evict everything useful.
+-  if ((ultimo - primero + 1) * kBloqueCache > limite / 2) {
++  if ((ultimo - primero + 1) * bloque > limite / 2) {
+     return false;
+   }
+ 
+-  std::lock_guard lock(g_cache_mutex);
++  std::unique_lock lock(g_cache_mutex);
++  if (g_cache_sin_memoria) {
++    return false;
++  }
+   size_t copiados = 0;
+-  for (uint64_t b = primero; b <= ultimo; ++b) {
++  bool fin_de_fichero = false;
++  uint64_t b = primero;
++  for (; b <= ultimo; ++b) {
+     const uint64_t clave = (static_cast<uint64_t>(id) << 32) | b;
+     auto it = g_cache.find(clave);
+     if (it == g_cache.end()) {
+-      // Contiguous run of missing blocks: a single read for all of them.
+-      uint64_t fin = b;
+-      while (fin < ultimo && !g_cache.count((static_cast<uint64_t>(id) << 32) | (fin + 1))) {
+-        ++fin;
++      break;
++    }
++    ++g_cache_aciertos;
++    TocarBloque(clave, it->second);
++    const size_t dentro = byte_offset + copiados - static_cast<size_t>(b * bloque);
++    if (dentro >= it->second.datos.size()) {
++      fin_de_fichero = true;  // the block ends before the requested range
++      break;
++    }
++    const size_t n = std::min(it->second.datos.size() - dentro, pedido - copiados);
++    std::memcpy(buffer.data() + copiados, it->second.datos.data() + dentro, n);
++    copiados += n;
++    if (it->second.datos.size() < bloque) {
++      fin_de_fichero = true;  // short block: no more file
++      break;
++    }
++  }
++
++  if (!fin_de_fichero && b <= ultimo) {
++    const size_t inicio = static_cast<size_t>(b * bloque);
++    const size_t tramo = static_cast<size_t>(ultimo - b + 1) * bloque;
++    lock.unlock();
++    std::vector<uint8_t> tmp;
++    size_t leidos = 0;
++    try {
++      tmp.resize(tramo);
++    } catch (const std::bad_alloc&) {
++      lock.lock();
++      if (!g_cache_sin_memoria) {
++        const uint64_t tenia = g_cache_bytes >> 20;
++        g_cache_sin_memoria = true;
++        g_cache.clear();
++        g_cache_lru.clear();
++        g_cache_bytes = 0;
++        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga (iba por {} MB). El juego sigue leyendo "
++                    "del disco como antes",
++                    tenia);
+       }
+-      const size_t tramo = static_cast<size_t>(fin - b + 1) * kBloqueCache;
+-      size_t leidos = 0;
+-      /*
+-       * If the console does not have that RAM, the cache turns itself off and does not try again:
+-       * the game carries on down the usual path. It can never bring the process down for lack of memory.
+-       */
+-      try {
+-        std::vector<uint8_t> tmp(tramo);
+-        /*
+-         * Same as LeerDirecta: in pieces, and a short read is not end of file (the file system
+-         * truncates large ones). The loop only stops when a piece returns 0 bytes. Without this,
+-         * half-filled blocks would be cached and the game would get incomplete data.
+-         */
+-        const int32_t trozo_mb = REXCVAR_GET(nfsmw_io_trozo_mb);
+-        const size_t trozo = trozo_mb > 0 ? static_cast<size_t>(trozo_mb) * 1024u * 1024u : tramo;
+-        while (leidos < tramo) {
+-          size_t n = 0;
+-          const size_t pide = std::min(trozo, tramo - leidos);
+-          if (!fh->Read(b * kBloqueCache + leidos, tmp.data() + leidos, pide, &n)) {
+-            if (leidos == 0) {
+-              return false;  // real error: let the usual path answer
+-            }
+-            break;
+-          }
+-          if (n == 0) {
+-            break;  // fin de fichero
+-          }
+-          leidos += n;
++      return false;
++    }
++    /*
++     * Same as LeerDirecta: in pieces, and a short read is not end of file (the file system truncates
++     * large ones). The loop only stops when a piece returns 0 bytes. Without this, half-filled blocks
++     * would be cached and the game would get incomplete data.
++     */
++    const int32_t trozo_mb = REXCVAR_GET(nfsmw_io_trozo_mb);
++    const size_t trozo = trozo_mb > 0 ? static_cast<size_t>(trozo_mb) * 1024u * 1024u : tramo;
++    while (leidos < tramo) {
++      size_t n = 0;
++      const size_t pide = std::min(trozo, tramo - leidos);
++      if (!fh->Read(inicio + leidos, tmp.data() + leidos, pide, &n)) {
++        if (leidos == 0) {
++          return false;  // real error: let the usual path answer
+         }
+-        ++g_cache_fallos;
+-        g_cache_bytes_disco += leidos;
+-        for (uint64_t k = b; k <= fin; ++k) {
+-          const size_t desde = static_cast<size_t>(k - b) * kBloqueCache;
++        break;
++      }
++      if (n == 0) {
++        break;  // end of file
++      }
++      leidos += n;
++    }
++    lock.lock();
++    ++g_cache_fallos;
++    g_cache_bytes_disco += leidos;
++    if (!g_cache_sin_memoria) {
++      try {
++        for (uint64_t k = b; k <= ultimo; ++k) {
++          const size_t desde = static_cast<size_t>(k - b) * bloque;
+           if (desde >= leidos) {
+-            break;  // fin de fichero
++            break;  // end of file
+           }
+-          const size_t n = std::min(kBloqueCache, leidos - desde);
+           const uint64_t ck = (static_cast<uint64_t>(id) << 32) | k;
++          if (g_cache.count(ck)) {
++            continue;  // brought in by another thread meanwhile
++          }
++          const size_t n = std::min(bloque, leidos - desde);
+           BloqueCache& nuevo = g_cache[ck];
+           nuevo.datos.assign(tmp.begin() + desde, tmp.begin() + desde + n);
+           g_cache_bytes += n;
+           TocarBloque(ck, nuevo);
+         }
++        PodarCache(limite);
+       } catch (const std::bad_alloc&) {
+-        const uint64_t tenia = g_cache_bytes >> 20;
+         g_cache_sin_memoria = true;
+         g_cache.clear();
+         g_cache_lru.clear();
+         g_cache_bytes = 0;
+-        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga (iba por {} MB). El juego sigue leyendo "
+-                    "del disco como antes",
+-                    tenia);
+-        return false;
+-      }
+-      PodarCache(limite);
+-      it = g_cache.find(clave);  // the insertion may have rebuilt the table
+-      if (it == g_cache.end()) {
+-        break;  // not even the first block had bytes: end of file
++        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga");
+       }
+-    } else {
+-      ++g_cache_aciertos;
+-      TocarBloque(clave, it->second);
+-    }
+-    const size_t dentro = byte_offset + copiados - static_cast<size_t>(b * kBloqueCache);
+-    if (dentro >= it->second.datos.size()) {
+-      break;  // the block ends before the requested range: end of file
+     }
+-    const size_t n = std::min(it->second.datos.size() - dentro, pedido - copiados);
+-    std::memcpy(buffer.data() + copiados, it->second.datos.data() + dentro, n);
+-    copiados += n;
+-    if (it->second.datos.size() < kBloqueCache) {
+-      break;  // short block: no more file
++    const size_t dentro = byte_offset + copiados - inicio;
++    if (dentro < leidos) {
++      const size_t n = std::min(leidos - dentro, pedido - copiados);
++      std::memcpy(buffer.data() + copiados, tmp.data() + dentro, n);
++      copiados += n;
+     }
+   }
+   g_cache_bytes_servidos += copiados;
+   *out_bytes_read = copiados;
+ 
+   const uint64_t vueltas = g_cache_aciertos + g_cache_fallos;
+-  if (vueltas >= g_cache_informe + 200) {
++  if (vueltas >= g_cache_informe + 2000) {
+     g_cache_informe = vueltas;
+-    REXLOG_INFO("[io] cache en RAM: {} bloques ({} MB de {}), {} servidas de RAM y {} del disco "
++    REXLOG_INFO("[io] cache en RAM: {} bloques de {} KB ({} MB de {}), {} servidas de RAM y {} del disco "
+                 "({:.1f} % de aciertos); {:.1f} MB entregados, {:.1f} leidos de la SD, {} bloques "
+                 "expulsados",
+-                g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(nfsmw_io_cache_mb), g_cache_aciertos,
+-                g_cache_fallos, vueltas ? 100.0 * double(g_cache_aciertos) / double(vueltas) : 0.0,
++                g_cache.size(), bloque / 1024, g_cache_bytes >> 20, REXCVAR_GET(nfsmw_io_cache_mb),
++                g_cache_aciertos, g_cache_fallos,
++                vueltas ? 100.0 * double(g_cache_aciertos) / double(vueltas) : 0.0,
+                 double(g_cache_bytes_servidos) / 1048576.0, double(g_cache_bytes_disco) / 1048576.0,
+                 g_cache_expulsados);
+   }
+diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_processor.cpp
+index f80e13a..20d39eb 100644
+--- a/sdk/src/graphics/command_processor.cpp
++++ b/sdk/src/graphics/command_processor.cpp
+@@ -208,6 +208,9 @@ void CommandProcessor::WorkerThreadMain() {
+   }
+ 
+   while (worker_running_) {
++    if (ring_reset_pending_.exchange(false, std::memory_order_seq_cst)) {
++      read_ptr_index_ = 0;  // réinitialisation de l'anneau (InitializeRingBuffer)
++    }
+     while (!pending_fns_.empty()) {
+       auto fn = std::move(pending_fns_.front());
+       pending_fns_.pop();
+@@ -248,10 +251,17 @@ void CommandProcessor::WorkerThreadMain() {
+         continue;
+       }
+     }
++    if (ring_reset_pending_.exchange(false, std::memory_order_seq_cst)) {
++      read_ptr_index_ = 0;  // réinitialisée pendant l'attente : relire le pointeur d'écriture
++      continue;
++    }
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    if (ring_reset_pending_.exchange(false, std::memory_order_seq_cst)) {
++      read_ptr_index_ = 0;  // réinitialisée pendant l'exécution : la position atteinte ne vaut plus
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -324,9 +334,16 @@ bool CommandProcessor::SetupContext() {
+ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+-  read_ptr_index_ = 0;
++  // Torchlight : appelée depuis un thread du jeu. La remise à zéro de read_ptr_index_ est faite par le thread du GPU
++  // (ring_reset_pending_), seul à l'écrire : sinon elle était écrasée par ExecutePrimaryBuffer en cours, et le GPU
++  // repartait de son ancienne position (interblocage aléatoire au démarrage : fence jamais exécutée). Drapeau posé
++  // AVANT de remettre le pointeur d'écriture à zéro : un thread du GPU qui voit l'ancien pointeur d'écriture n'a rien
++  // de nouveau à exécuter ; s'il voit le nouveau, il voit aussi le drapeau.
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
++  ring_reset_pending_.store(true, std::memory_order_seq_cst);
++  write_ptr_index_.store(0, std::memory_order_seq_cst);
++  if (write_ptr_index_event_) write_ptr_index_event_->Set();
+ }
+ 
+ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+@@ -1438,8 +1455,16 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+ 
+       bool major_mode_explicit =
+           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
++      // Torchlight (rendu natif) : quand l'application fournit elle-même l'image (Presenter::
++      // SetGuestOutputFromApp), les dessins, effacements et résolutions EDRAM du jeu ne servent plus à rien.
++      // Le paquet est lu et considéré comme exécuté ; la synchronisation (événements, registres) continue.
++      const ui::Presenter* app_presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
++      if (app_presenter && app_presenter->IsGuestOutputFromApp()) {
++        draw_succeeded = true;
++      } else {
++        draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
++                                   is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
++      }
+       if (!draw_succeeded) {
+         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+diff --git a/sdk/src/input/sdl/sdl_input_driver.cpp b/sdk/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..7ff7f9a 100644
+--- a/sdk/src/input/sdl/sdl_input_driver.cpp
++++ b/sdk/src/input/sdl/sdl_input_driver.cpp
+@@ -323,6 +323,11 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+   // Handle repeating
+   auto guest_now = rex::chrono::Clock::QueryGuestUptimeMillis();
+   static_assert(HID_SDL_REPEAT_DELAY >= HID_SDL_REPEAT_RATE);
++  // torchlight : touche répétée relâchée entre deux interrogations : pas d'appui répété fantôme (voir le pilote
++  // Switch).
++  if (last.repeat_state != RepeatState::Idle && !(curr_butts & (uint64_t(1) << last.repeat_butt_idx))) {
++    last.repeat_state = RepeatState::Idle;
++  }
+   if (last.repeat_state == RepeatState::Waiting &&
+       (last.repeat_time + HID_SDL_REPEAT_DELAY < guest_now)) {
+     last.repeat_state = RepeatState::Repeating;
+diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
+index ccf5e2a..662c8e5 100644
+--- a/sdk/src/input/switch/switch_input_driver.cpp
++++ b/sdk/src/input/switch/switch_input_driver.cpp
+@@ -610,6 +610,13 @@ X_RESULT SwitchInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+ 
+   // Handle repeating
+   const auto guest_now = static_cast<uint32_t>(rex::chrono::Clock::QueryGuestUptimeMillis());
++  // torchlight : la touche répétée a été relâchée entre deux interrogations (le jeu ne lisait pas les frappes,
++  // écran de chargement ou cinématique) : pas de répétition, le relâchement est signalé plus bas. Sans cela, le
++  // premier appel suivant renvoyait un appui répété fantôme (choix du personnage validé tout seul, cinématique
++  // coupée).
++  if (slot->repeat_state != RepeatState::kIdle && !(curr_butts & (uint64_t(1) << slot->repeat_index))) {
++    slot->repeat_state = RepeatState::kIdle;
++  }
+   if (slot->repeat_state == RepeatState::kWaiting &&
+       (slot->repeat_time + kRepeatDelayMs < guest_now)) {
+     slot->repeat_state = RepeatState::kRepeating;
+diff --git a/sdk/src/kernel/xam/xam_ui.cpp b/sdk/src/kernel/xam/xam_ui.cpp
+index 5a572ce..c5ec02e 100644
+--- a/sdk/src/kernel/xam/xam_ui.cpp
++++ b/sdk/src/kernel/xam/xam_ui.cpp
+@@ -29,6 +29,10 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#if defined(__SWITCH__)
++#include <switch.h>
++#endif
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -461,9 +465,6 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+         return X_ERROR_SUCCESS;
+       }
+     };
+-    const Runtime* emulator = REX_KERNEL_STATE()->emulator();
+-    ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+-
+     // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
+     std::string title_str = title
+                                 ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+@@ -478,6 +479,36 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+                            REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
+                      : "";
+ 
++#if defined(__SWITCH__)
++    // Console : clavier virtuel du système (applet swkbd), sur le thread de répartition du noyau (l'applet bloque
++    // jusqu'à la validation). Annulé (B, ou échec de l'applet) : X_ERROR_CANCELLED, comme la boîte ImGui.
++    auto run = [buffer, buffer_length, title_str, desc_str, def_text_str](uint32_t& extended_error,
++                                                                          uint32_t& length) -> X_RESULT {
++      length = 0;
++      extended_error = X_ERROR_CANCELLED;
++      SwkbdConfig kbd;
++      if (R_FAILED(swkbdCreate(&kbd, 0))) {
++        REXKRNL_ERROR("XamShowKeyboardUI : swkbdCreate a échoué");
++        return X_ERROR_SUCCESS;
++      }
++      swkbdConfigMakePresetDefault(&kbd);
++      if (!title_str.empty()) swkbdConfigSetHeaderText(&kbd, title_str.c_str());
++      if (!desc_str.empty()) swkbdConfigSetSubText(&kbd, desc_str.c_str());
++      swkbdConfigSetInitialText(&kbd, def_text_str.c_str());
++      if (buffer_length > 1) swkbdConfigSetStringLenMax(&kbd, buffer_length - 1);
++      std::vector<char> out(size_t(buffer_length) * 4 + 4, 0);
++      const Result rc = swkbdShow(&kbd, out.data(), out.size());
++      swkbdClose(&kbd);
++      if (R_FAILED(rc)) return X_ERROR_SUCCESS;
++      auto text = rex::string::to_utf16(std::string(out.data()));
++      rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
++      extended_error = X_ERROR_SUCCESS;
++      return X_ERROR_SUCCESS;
++    };
++    return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
++#endif
++    const Runtime* emulator = REX_KERNEL_STATE()->emulator();
++    ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+     if (imgui_drawer) {
+       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
+       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..9427c88 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -1452,7 +1452,29 @@ REX_EXPORT(__imp__NtYieldExecution, rex::kernel::xboxkrnl::NtYieldExecution_entr
+ REX_EXPORT(__imp__KeQuerySystemTime, rex::kernel::xboxkrnl::KeQuerySystemTime_entry)
+ REX_EXPORT(__imp__KeTlsAlloc, rex::kernel::xboxkrnl::KeTlsAlloc_entry)
+ REX_EXPORT(__imp__KeTlsFree, rex::kernel::xboxkrnl::KeTlsFree_entry)
+-REX_EXPORT(__imp__KeTlsGetValue, rex::kernel::xboxkrnl::KeTlsGetValue_entry)
++// Torchlight : KeTlsGetValue sans l'adaptateur HostToGuestFunction ni la recherche du XThread courant par le TLS de
++// l'hôte (appelée par l'allocateur mémoire du jeu à chaque allocation et libération : ~1 % du thread principal sur
++// la console). Le thread invité courant se lit dans son PCR (r13) : prcb_data.current_thread -> X_KTHREAD, dont
++// tls_address est tls_dynamic_address_ (XThread::InitializeGuestObject). Cases au-delà des 32 premières (TlsAlloc les
++// distribue à partir de 0) ou PCR inattendu : chemin d'origine. Validé sur PC : 23,2 millions d'appels, 0 différence.
++extern "C" REX_FUNC(__imp__KeTlsGetValue) {
++  const uint32_t slot = ctx.r3.u32;
++  const uint32_t pcr = ctx.r13.u32;
++  if (slot < 32 && pcr) {
++    const uint32_t kthread = rex::memory::load_and_swap<uint32_t>(
++        base + pcr + offsetof(rex::system::X_KPCR, prcb_data) + offsetof(rex::system::X_KPRCB, current_thread));
++    const uint32_t tls = kthread ? rex::memory::load_and_swap<uint32_t>(
++                                       base + kthread + offsetof(rex::system::X_KTHREAD, tls_address))
++                                 : 0;
++    if (tls) {
++      ctx.r3.u64 = rex::memory::load_and_swap<uint32_t>(base + tls + slot * 4);
++      return;
++    }
++  }
++  ctx.r3.u64 = rex::kernel::xboxkrnl::KeTlsGetValue_entry(slot);
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeTlsGetValue("__imp__KeTlsGetValue",
++                                                                        &__imp__KeTlsGetValue);
+ REX_EXPORT(__imp__KeTlsSetValue, rex::kernel::xboxkrnl::KeTlsSetValue_entry)
+ REX_EXPORT(__imp__KeInitializeEvent, rex::kernel::xboxkrnl::KeInitializeEvent_entry)
+ REX_EXPORT(__imp__KeSetEvent, rex::kernel::xboxkrnl::KeSetEvent_entry)
+diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
+index 78826a6..e9487ae 100644
+--- a/sdk/src/system/xam/content_manager.cpp
++++ b/sdk/src/system/xam/content_manager.cpp
+@@ -158,6 +158,42 @@ bool CopiarCarpeta(const std::filesystem::path& origen, const std::filesystem::p
+   return bien;
+ }
+ 
++/*
++ * Deletes a folder and everything in it (torchlight, 2026-10-02). std::filesystem::remove_all lists the folder with
++ * std::filesystem, which lists folders wrongly on Horizon: on the console, deleting a character did nothing (the
++ * character stayed in the selection list). The listing goes through ListFiles (opendir/readdir, which work), and each
++ * entry is removed on its own (single std::filesystem::remove calls, no listing). Returns how many entries were
++ * removed, folder included; ec holds the first error.
++ */
++uint64_t BorrarCarpeta(const std::filesystem::path& carpeta, std::error_code& ec) {
++  ec.clear();
++  std::error_code e;
++  if (!std::filesystem::exists(carpeta, e)) {
++    return 0;
++  }
++  uint64_t borrados = 0;
++  for (const auto& f : rex::filesystem::ListFiles(carpeta)) {
++    const std::filesystem::path ruta = carpeta / f.name;
++    std::error_code e2;
++    if (f.type == rex::filesystem::FileInfo::Type::kDirectory || std::filesystem::is_directory(ruta, e2)) {
++      borrados += BorrarCarpeta(ruta, e2);
++    } else if (std::filesystem::remove(ruta, e2)) {
++      ++borrados;
++    }
++    if (e2 && !ec) {
++      ec = e2;
++    }
++  }
++  std::error_code e3;
++  if (std::filesystem::remove(carpeta, e3)) {
++    ++borrados;
++  }
++  if (e3 && !ec) {
++    ec = e3;
++  }
++  return borrados;
++}
++
+ // The readable copy: <content_backup_root>/<perfil>/actual, and the previous one to <perfil>/anterior.
+ void CopiaParaElUsuario(const std::string_view nombre, const std::filesystem::path& origen) {
+   const std::string raiz = REXCVAR_GET(content_backup_root);
+@@ -171,14 +207,14 @@ void CopiaParaElUsuario(const std::string_view nombre, const std::filesystem::pa
+ 
+   std::error_code ec;
+   if (std::filesystem::exists(actual, ec)) {
+-    std::filesystem::remove_all(anterior, ec);
++    BorrarCarpeta(anterior, ec);
+     ec.clear();
+     std::filesystem::rename(actual, anterior, ec);
+     if (ec) {
+       // If renaming is not allowed, copy and delete: what matters is not losing the previous version.
+       uint32_t n = 0;
+       CopiarCarpeta(actual, anterior, n);
+-      std::filesystem::remove_all(actual, ec);
++      BorrarCarpeta(actual, ec);
+       ec.clear();
+     }
+   }
+@@ -563,7 +599,9 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
+   std::error_code ec;
+-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
++  auto dir_removed = BorrarCarpeta(package_path, ec);
++  REXSYS_INFO("[contenido] borrado de {}: {} entrada(s){}", rex::path_to_utf8(package_path), dir_removed,
++              ec ? " ERROR " + ec.message() : std::string());
+   if (ec) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+@@ -615,7 +653,9 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
+       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+ 
+   std::error_code ec;
+-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
++  auto dir_removed = BorrarCarpeta(package_path, ec);
++  REXSYS_INFO("[contenido] desmontado y borrado de {}: {} entrada(s){}", rex::path_to_utf8(package_path),
++              dir_removed, ec ? " ERROR " + ec.message() : std::string());
+   if (ec) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+diff --git a/sdk/src/system/xfile.cpp b/sdk/src/system/xfile.cpp
+index 4179e8b..708b7e5 100644
+--- a/sdk/src/system/xfile.cpp
++++ b/sdk/src/system/xfile.cpp
+@@ -37,7 +37,18 @@ XFile::XFile() : XObject(kObjectType) {
+ XFile::~XFile() {
+   // TODO(benvanik): signal that the file is closing?
+   async_event_->Set();
++  // torchlight, 2026-10-02 : suppression à la fermeture (NtSetInformationFile, FileDispositionInformation : c'est
++  // ainsi que DeleteFile supprime sur Xbox). Le drapeau était posé sur l'entrée mais jamais appliqué : supprimer un
++  // personnage de Torchlight (fichier <n>.tsv dans le conteneur de sauvegarde) ne faisait rien. Appliqué après la
++  // fermeture du fichier hôte : sur la Switch, un fichier ouvert ne peut pas être supprimé.
++  rex::filesystem::Entry* entry = file_->entry();
++  const bool supprimer = entry && entry->delete_on_close() && entry->parent();
++  const std::string chemin = supprimer ? entry->path() : std::string();
+   file_->Destroy();
++  if (supprimer) {
++    const bool ok = entry->Delete();
++    REXFS_INFO("[io] supprimé à la fermeture : {} ({})", chemin, ok ? "fait" : "ÉCHEC");
++  }
+ }
+ 
+ uint64_t XFile::position() const {
+diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
+index b4c89f1..a606352 100644
+--- a/sdk/src/ui/presenter.cpp
++++ b/sdk/src/ui/presenter.cpp
+@@ -676,6 +676,25 @@ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  if (guest_output_from_app_.load(std::memory_order_relaxed)) {
++    return false;
++  }
++  return RefreshGuestOutputCommon(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                  display_aspect_ratio_y, std::move(refresher));
++}
++
++bool Presenter::RefreshGuestOutputFromApp(
++    uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++    uint32_t display_aspect_ratio_y,
++    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  return RefreshGuestOutputCommon(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
++                                  display_aspect_ratio_y, std::move(refresher));
++}
++
++bool Presenter::RefreshGuestOutputCommon(
++    uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
++    uint32_t display_aspect_ratio_y,
++    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
+index 6b3d30a..a883661 100644
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -63,6 +63,8 @@ const char* RexSwitchLogDir(void);
+  */
+ size_t RexGmCommittedBytes(void);
+ size_t RexGmMappedBytes(void);
++size_t RexGmChunkCount(void);
++size_t RexGmProtectedPages(void);
+ /* 0 = sin probar, 1 = permisos (paginas vigiladas legibles), 2 = desmapeo. */
+ int RexGmModoProteccion(void);
+ Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem,
+@@ -102,7 +104,7 @@ constexpr u64 kReportSeconds = 10;
+  */
+ constexpr u64 kStartDelayNs = 8000000000ULL;
+ constexpr size_t kMaxSamples = 1 << 15;
+-constexpr size_t kFrames = 10;
++constexpr size_t kFrames = 48;  // Torchlight : piles complètes (10 tronquait les fonctions appelées en profondeur)
+ constexpr unsigned kCounterCount = 33;
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
+ std::string ReportPath() {
+@@ -262,6 +264,54 @@ void LimiteDeMapeo(u64* usado_mb, u64* tope_mb, u64* proceso_mb, u64* total_mb)
+   svcCloseHandle(reslimit);
+ }
+ 
++/*
++ * Kernel memory blocks (Torchlight). Every region of the address space with its own
++ * state, permission or attribute is one KMemoryBlock, and running out of them makes
++ * even a small commit fail with 0xCE01 (OutOfResource) while plenty of memory is free.
++ * They come from the process's own system resource when its NPDM declares one
++ * (SystemResourceSize: the overridden title's, since the homebrew runs in its
++ * process), otherwise from a pool shared with the system, which would explain why
++ * running out once hung the whole console. Walking the address space costs one
++ * svcQueryMemory per block, a few ms every 10 s.
++ */
++struct BloquesNucleo {
++  size_t total = 0;
++  size_t heap = 0;    // MemType_Heap: heap split by the backings mapped as code and by NvMap
++  size_t codigo = 0;  // MemType_ModuleCode*: shadows of the guest chunks
++  size_t vistas = 0;  // MemType_ProcessMem: guest views (svcMapProcessMemory)
++  size_t otros = 0;
++  u64 recurso_usado_kb = 0, recurso_total_kb = 0;
++};
++
++BloquesNucleo ContarBloques() {
++  BloquesNucleo b;
++  u64 addr = 0;
++  for (;;) {
++    MemoryInfo mi{};
++    u32 pi = 0;
++    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) break;
++    ++b.total;
++    switch (mi.type & MemState_Type) {
++      case MemType_Heap: ++b.heap; break;
++      case MemType_ModuleCodeStatic:
++      case MemType_ModuleCodeMutable: ++b.codigo; break;
++      case MemType_ProcessMem: ++b.vistas; break;
++      default: ++b.otros; break;
++    }
++    const u64 sig = mi.addr + mi.size;
++    if (sig <= addr) break;  // last block (unmapped up to the end of the space)
++    addr = sig;
++  }
++  u64 v = 0;
++  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0))) {
++    b.recurso_usado_kb = v >> 10;
++  }
++  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0))) {
++    b.recurso_total_kb = v >> 10;
++  }
++  return b;
++}
++
+ u64 g_base = 0, g_text_lo = 0, g_text_hi = 0;
+ Thread g_thread;
+ 
+@@ -388,7 +438,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+   std::fprintf(f,
+                "==== %.1f s | modo: %s | juego %.1f fps | CPU total %.0f%% (400%% = 4 nucleos) | fallos/s: "
+                "lectura emulada %.0f, manejador SDK %.0f, reintento emulado %.0f, SEH %.0f, "
+-               "fisica confirmada %.0f, vistas %.0f | invitado %zu/%zu MB (respaldo/mapeado) | "
++               "fisica confirmada %.0f, vistas %.0f | invitado %zu/%zu MB (respaldo/mapeado), %zu trozos, %zu paginas protegidas | "
+                "limite de mapeo %llu/%llu MB, proceso %llu/%llu MB | "
+                "muestras %zu | vigilancia: %s | samplers: %.0f nuevos/s, %.0f parones/s\n",
+                seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
+@@ -398,7 +448,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                double(counters_now[4] - counters_last[4]) / seconds,
+                double(counters_now[17] - counters_last[17]) / seconds,
+                double(counters_now[18] - counters_last[18]) / seconds,
+-               RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20,
++               RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20, RexGmChunkCount(),
++               RexGmProtectedPages(),
+                (u64)lim_usado, (u64)lim_tope, (u64)proc_usado, (u64)proc_total, g_sample_count,
+                 (RexGmModoProteccion() == 1   ? "permisos (paginas legibles)"
+                  : RexGmModoProteccion() == 2 ? "desmapeo (cada lectura falla)"
+@@ -421,6 +472,15 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console)
+                    ? "sobremesa"
+                    : "portatil");
++  {
++    const BloquesNucleo b = ContarBloques();
++    std::fprintf(f,
++                 "     nucleo: %zu bloques de memoria (heap %zu, sombras %zu, vistas %zu, otros %zu) | "
++                 "recurso de sistema del proceso %llu/%llu KB%s\n",
++                 b.total, b.heap, b.codigo, b.vistas, b.otros, (unsigned long long)b.recurso_usado_kb,
++                 (unsigned long long)b.recurso_total_kb,
++                 b.recurso_total_kb == 0 ? " (ninguno: bloques del fondo compartido con el sistema)" : "");
++  }
+   // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
+   // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
+   // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
+@@ -551,6 +611,18 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+ 
+   std::vector<Sample> samples(g_samples, g_samples + g_sample_count);
+   g_sample_count = 0;
++  // Torchlight : échantillons bruts (rex_pilas.txt) pour une agrégation complète hors de la console :
++  // une ligne par échantillon, nom du thread puis pc et adresses de retour, relatifs à l'image.
++  if (!samples.empty()) {
++    if (FILE* raw = std::fopen((std::string(RexSwitchLogDir()) + "rex_pilas.txt").c_str(), "a")) {
++      for (const Sample& smp : samples) {
++        std::fprintf(raw, "%s|%" PRIx64, g_slots[smp.slot].name, smp.pc - g_base);
++        for (size_t k = 0; k < kFrames && smp.frames[k]; ++k) std::fprintf(raw, " %" PRIx64, smp.frames[k] - g_base);
++        std::fprintf(raw, "\n");
++      }
++      std::fclose(raw);
++    }
++  }
+   std::sort(samples.begin(), samples.end(),
+             [](const Sample& a, const Sample& b) { return a.slot < b.slot; });
+ 
+@@ -816,6 +888,11 @@ void ProfilerMain(void*) {
+   if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
+     std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
+                  g_text_hi);
++    // Title whose process the homebrew runs in (title override): its NPDM sets the system resource the
++    // kernel memory blocks come from (see ContarBloques).
++    u64 programa = 0;
++    svcGetInfo(&programa, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
++    std::fprintf(f, "Proceso del titulo %016" PRIx64 "\n", programa);
+     std::fprintf(f, "Muestreo de pilas: %s\n", sample_stacks ? "activo (1 ms)" : "desactivado");
+     std::fclose(f);
+   }
+diff --git a/sdk/thirdparty/CMakeLists.txt b/sdk/thirdparty/CMakeLists.txt
+index aa3c58c..4a09c14 100644
+--- a/sdk/thirdparty/CMakeLists.txt
++++ b/sdk/thirdparty/CMakeLists.txt
+@@ -337,11 +337,23 @@ if(REXGLUE_USE_VULKAN)
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spirv-tools/include>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+ 
++    # Torchlight (rendu natif) : compilation HLSL -> SPIR-V dans le jeu, sur la console. glslang avec son entrée
++    # HLSL, et SPIRV-Tools pour la légalisation du SPIR-V produit depuis du HLSL (passes appelées par glslang).
++    option(REXGLUE_GLSLANG_HLSL "glslang avec HLSL et SPIRV-Tools (compilation de shaders HLSL à l'exécution)" OFF)
++    if(REXGLUE_GLSLANG_HLSL)
++        set(SPIRV-Headers_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/spirv-headers CACHE PATH "" FORCE)
++        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
++        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
++        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
++        set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
++        add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
++    endif()
++
+     # glslang/SPIRV - SPIR-V code generation for shader translation
+     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+     set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+-    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+-    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
++    set(ENABLE_HLSL ${REXGLUE_GLSLANG_HLSL} CACHE BOOL "" FORCE)
++    set(ENABLE_OPT ${REXGLUE_GLSLANG_HLSL} CACHE BOOL "" FORCE)
+     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+     set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+     # Enable RTTI for spv::Builder inheritance in SpirvBuilder

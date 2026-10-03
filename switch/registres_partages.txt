@@ -1,0 +1,7 @@
+# Fonctions qui reçoivent des registres de leur appelante (lus avant d'être écrits avec cr_as_local / xer_as_local /
+# ctr_as_local / non_volatile_as_local) : share_registers, ajouté par gen_manifest.sh.
+# Seulement des fonctions SANS prologue qui sauvegarde ces registres : marquer une fonction qui les sauvegarde (et les
+# restaure par __restgprlr, absent avec non_volatile_as_local) fait reprendre à son appelante des valeurs jamais
+# restaurées. Essai du 2026-10-02 : 39 fausses alertes de boucles marquées par erreur, plantage au démarrage
+# (sub_82737F60 rendait son code d'erreur dans r31 ; lecture de 0xD4 dans sub_827380E0).
+0x82864230   # sans prologue, lit r14-r31, f14-f31, cr1-cr7 (sauvegarde de tout le contexte, du genre setjmp)

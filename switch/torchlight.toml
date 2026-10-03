@@ -1,0 +1,32 @@
+# Réglages de la version Switch, FACULTATIFS : les valeurs ci-dessous sont aussi les valeurs par défaut du .nro
+# (OnPostInitLogging de src/torchlight_app.h, à garder en accord). Copié à côté du .nro (sdmc:/switch/torchlight/),
+# ce fichier les remplace. Lu au démarrage par le runtime ; les options de ligne de commande PC s'écrivent ici
+# sous la forme nom = valeur, AVANT toute section [...] (sinon elles appartiennent à la section).
+
+# Rendu natif (switch/RENDU_NATIF.md) : images redessinées avec Vulkan à partir des appels d'Ogre, à la place de
+# l'émulation du GPU Xenos (trop lente sur la console). torchlight_natif_seul : les dessins ne sont plus transmis
+# à l'émulation. Les shaders sont compilés par la console elle-même, à partir des sources que le jeu génère, et
+# gardés dans torchlight/cache/natif (le premier lancement est plus lent aux chargements).
+torchlight_natif = true
+torchlight_natif_seul = true
+
+# Variables du pilote Mesa/NVK (NOM=valeur;...), posées avant la création de Vulkan.
+# NVK_SWITCH_ZCULL=0 : test du blocage GPU au chargement de la ville (2026-09-30).
+# Mettre "" pour revenir au comportement normal (ZCULL actif).
+mesa_env = "NVK_SWITCH_ZCULL=0"
+
+# Lectures de pak.zip (140 Mo, lu par tout petits morceaux dispersés) : cache en RAM par blocs de 64 Ko (32 Mo,
+# LRU) au lieu de la fenêtre de 256 Ko de nfsmw-nx, rechargée à chaque saut (157 Mo lus sur la SD pour 27,7 Mo
+# demandés jusqu'à la mine ; avec le cache : 17,3 Mo en 280 lectures). Voir switch/RENDU_NATIF.md (2026-10-02).
+# Session de 30 min (2026-10-02, cache de 32 Mo) : 98,2 % de lectures servies depuis la RAM, 145 Mo livrés pour 86 Mo
+# lus sur la SD, mais cache plein et 872 blocs expulsés : 64 Mo. Le cache de plages (lectures de 256 Ko et plus)
+# ne sert jamais à Torchlight : coupé, son budget passe au cache par blocs.
+nfsmw_io_ventana_kb = 0
+nfsmw_io_cache_mb = 64
+nfsmw_io_cache_bloque_kb = 64
+nfsmw_io_rangos_mb = 0
+
+[log.levels]
+# Le jeu essaie plusieurs chemins pour chaque fichier (game:\music\..., game:\programs\...) :
+# des milliers d'avertissements NtCreateFile bénins, chacun écrit sur la SD en plusieurs ms.
+krnl = "error"

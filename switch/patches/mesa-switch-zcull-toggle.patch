@@ -1,0 +1,25 @@
+--- a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c	2026-09-30 18:36:57.329165271 +0200
++++ b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_pdev.c	2026-09-30 18:36:57.335412727 +0200
+@@ -8,6 +8,7 @@
+ #include "nvk_device.h"
+ #include "vk_log.h"
+ #include "util/cnd_monotonic.h"
++#include "util/u_debug.h"
+ #include "util/os_time.h"
+ #include "util/u_memory.h"
+ #include "util/macros.h"
+@@ -476,8 +477,13 @@
+     * nothing is left dangling when it is released. Failure is not fatal: the driver carries on
+     * without hierarchical depth culling.
+     */
++   /* NVK_SWITCH_ZCULL=0 leaves the geometry unpublished: has_zcull_info stays
++    * false, so no plane, no ZCULL context and no ZCULL methods (Torchlight test:
++    * the Xenos emulation creates depth targets such as 560x4688).
++    */
+    struct nouveau_horizon_runtime *zcull_runtime = NULL;
+-   if (nouveau_horizon_runtime_get(&zcull_runtime) == NOUVEAU_HORIZON_SUCCESS) {
++   if (debug_get_bool_option("NVK_SWITCH_ZCULL", true) &&
++       nouveau_horizon_runtime_get(&zcull_runtime) == NOUVEAU_HORIZON_SUCCESS) {
+       nouveau_horizon_add_zcull_info(&pdev->base.dev_info);
+       nouveau_horizon_runtime_put(zcull_runtime);
+    }

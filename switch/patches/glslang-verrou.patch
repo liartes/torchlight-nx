@@ -1,0 +1,27 @@
+--- a/sdk/thirdparty/glslang/glslang/OSDependent/Unix/ossource.cpp	2026-10-01 19:44:31.091185207 +0200
++++ b/sdk/thirdparty/glslang/glslang/OSDependent/Unix/ossource.cpp	2026-10-01 19:44:31.106474189 +0200
+@@ -172,7 +172,11 @@
+     pthread_mutex_t gMutex;
+ }
+ 
+-void InitGlobalLock()
++// Torchlight : initialisé une seule fois. InitializeProcess() le réinitialisait à chaque appel ; deux appelants
++// (le SDK pour ses shaders GLSL, le rendu natif pour le HLSL du jeu) pouvaient l'écraser pendant qu'un autre thread
++// le tenait, et la compilation suivante restait bloquée pour toujours (vu sur Switch).
++static pthread_once_t gMutexOnce = PTHREAD_ONCE_INIT;
++static void InitGlobalLockOnce()
+ {
+   pthread_mutexattr_t mutexattr;
+   pthread_mutexattr_init(&mutexattr);
+@@ -180,6 +184,11 @@
+   pthread_mutex_init(&gMutex, &mutexattr);
+ }
+ 
++void InitGlobalLock()
++{
++  pthread_once(&gMutexOnce, InitGlobalLockOnce);
++}
++
+ void GetGlobalLock()
+ {
+   pthread_mutex_lock(&gMutex);

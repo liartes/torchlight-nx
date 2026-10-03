@@ -1,0 +1,56 @@
+diff --git a/build-switch.sh b/build-switch.sh
+index cc2722da8cb..d06f621866f 100755
+--- a/build-switch.sh
++++ b/build-switch.sh
+@@ -12,12 +12,18 @@ fi
+ 
+ # Start the build container.
+ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
++# Rust target for Switch code: without it, the wrapper in the container uses the
++# host target and libnak_rs/nil come out as x86-64 objects (link fails in the NRO).
+ docker run -d --name "$CONTAINER_NAME" \
++    -e MESA_SWITCH_RUST_TARGET=aarch64-unknown-linux-gnu \
+     -v "$(pwd):/project" --workdir "/project" \
+     "$IMAGE_NAME" sleep infinity
+ 
+ run() { docker exec "$CONTAINER_NAME" bash -c "$1"; }
+ 
++# Standard library of the Rust target above.
++run '/root/.cargo/bin/rustup target add aarch64-unknown-linux-gnu'
++
+ # Install cross-build wrappers for bindgen and Rust compiler probes.
+ run '
+ mkdir -p /usr/local/libexec
+@@ -99,7 +105,7 @@ export PATH="/usr/local/libexec:/project/builddir-native/src/compiler/clc:/proje
+ cd /project && meson setup builddir-switch --wipe \
+     --cross-file switch_cross_file.txt \
+     --buildtype=release \
+-    -Doptimization=1 \
++    -Doptimization=2 \
+     -Db_lto=false \
+     -Db_ndebug=true \
+     -Dvulkan-drivers=nouveau \
+diff --git a/rustc-switch-wrapper.sh b/rustc-switch-wrapper.sh
+index 008e20db5cb..37c3c613810 100755
+--- a/rustc-switch-wrapper.sh
++++ b/rustc-switch-wrapper.sh
+@@ -33,6 +33,10 @@ fi
+ for arg in "$@"; do
+     case "$arg" in
+         *sanity_check_for_rust.rs*|*sanitycheckrs.rs*) RUST_TARGET= ;;
++        # Host crates (proc-macros and their deps: syn, quote...) come through here
++        # too, since this wrapper shadows rustc in PATH. Meson gives them the host
++        # linker; Switch crates get aarch64-none-elf-gcc.
++        linker=cc|-Clinker=cc) RUST_TARGET= ;;
+     esac
+ done
+ 
+@@ -65,6 +69,8 @@ done
+ # (e.g. the devkitpro-mesa-rust container) it does not exist and rustc would
+ # fail with "linker not found".
+ FALLBACK_LINKER=C:/msys64/ucrt64/bin/gcc.exe
++# The MSYS2 installed here is MINGW64, not UCRT64.
++[ -x "$FALLBACK_LINKER" ] || FALLBACK_LINKER=C:/msys64/mingw64/bin/gcc.exe
+ if [ ! -x "$FALLBACK_LINKER" ]; then
+     FALLBACK_LINKER="$(command -v cc || command -v gcc || true)"
+ fi

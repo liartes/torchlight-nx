@@ -1,0 +1,10 @@
+# Sorties de compilation Switch
+out/
+out-*/
+# Code généré (rexglue codegen) et manifeste dérivé (gen_manifest.sh)
+generated/default/
+/torchlight_manifest.toml
+elf/
+out-pc/
+# Captures d'écran du jeu (images du jeu : jamais publiées)
+images/

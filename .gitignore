@@ -1,0 +1,23 @@
+# Fichiers du jeu (copie personnelle, à ne jamais publier)
+/assets/
+
+# Code généré par rexglue codegen (régénéré depuis le manifeste par run.sh)
+/generated/default/
+
+# Sorties de compilation
+/out/
+/dist/
+
+# Logs et sorties de lancement
+*.log
+run.txt
+
+# Sauvegardes manuelles du manifeste (remplacées par git)
+*.bak
+*.bak-*
+
+# Réglages personnels Claude Code
+/.claude/settings.local.json
+
+/pgo/
+/pilas-archive/

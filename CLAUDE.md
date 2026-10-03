@@ -1,0 +1,212 @@
+# Projet : recompilation de Torchlight (Xbox 360 XBLA) avec ReXGlue
+
+Objectif : version PC (Linux, faite) puis Switch (jouable, en cours d'optimisation).
+Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'exécutable, shaders générés en HLSL à
+l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
+
+## État et reprise (session du 2026-10-02, fin vers minuit)
+- Switch : jouable en rendu natif Vulkan, sauvegardes OK, clavier virtuel (swkbd), appuis fantômes corrigés.
+  Performances aux fréquences de base (CPU 1020 / GPU 307,2 / mémoire 1600 MHz), test n°23 (LTO + PGO) : ville
+  21,7-25 ms de rendu côté jeu (31-35 images/s sans profil, 29-30 avec), mine 17-19 ms (39-47 images/s) ; test
+  n°22 (même code avant le PGO et les réécritures du soir) : 28,7 ms, 27 images/s. Mesure « image » des bilans
+  [natif] = _updateAllRenderTargets seulement : la logique du jeu (~6 ms) s'y ajoute (35 images/s pour 22 ms).
+- Dernière build : switch/out-lto (LTO + PGO, profils pgo/ de la session de 30 min, pile sans volatile), avec les
+  correctifs de la suppression d'un personnage et des appuis fantômes (vérifiés sur console), et l'installation
+  depuis le paquet XBLA (2026-10-03, vérifiée sur la console : ~35 s, ~22 s après correction attendue).
+- Limite : le thread principal (Ogre ~74 %, logique ~25 %). Profil plat ; voir « Performances » pour la suite.
+- Consignes de l'utilisateur : optimiser aux fréquences de base (CPU 1020 MHz, RAM et GPU d'origine ; le surcadençage
+  reste au choix du joueur) et sans rien changer au rendu (pas d'ombres une image sur deux, pas de mise à jour
+  sautée : risque de clignotement). Répondre en français. Tests n°1 à 21 faits avec RAM et GPU surcadencés ;
+  à partir du n°22, fréquences de base (ligne « relojes » de rex_perfil.log).
+- Pour reprendre : lire la fin du journal switch/RENDU_NATIF.md (chaque essai, mesures, pièges). En cours :
+  préparation de la distribution (section « Distribution ») ; restent les tests sur console avant distribution
+  (« Problèmes ouverts et tâches »). Ensuite possible : parcours de l'octree natif (~0,5 ms, validation difficile).
+  Boutons ABXY et icônes : laissés tels quels (choix de l'utilisateur, peut-être plus tard).
+
+## Règles
+- Sauvegarder torchlight_manifest.toml avant toute modification.
+- Ne renommer ni supprimer de fichiers dans assets/ sans demander.
+- Les fichiers du jeu viennent de la copie légitime de l'utilisateur. Ne jamais versionner ni distribuer de données
+  dérivées du jeu : shaders compilés (la console les compile elle-même, raison légale), images (captures d'écran
+  comprises : switch/images/ est ignoré, retiré du dépôt le 2026-10-03 mais encore dans l'historique). nro-icon.png
+  n'est pas une image du jeu (trouvée ailleurs par l'utilisateur) : versionnée.
+- Dépôt destiné à être publié (GPL-3.0, LICENSE et THIRD_PARTY_NOTICES.md) : textes vus par les joueurs (fenêtres,
+  README.md) en anglais ; documentation de développement (CLAUDE.md, journal) en français.
+- Données utilisateur PC : ~/.local/share/torchlight/ (sauvegardes, cache) : ne pas supprimer. Les essais se font
+  sur une copie (switch/out-pc/donnees-test, faite par switch/natif_pc.sh).
+
+## Version PC (recompilation d'origine)
+SDK : ~/rexglue-sdk-0.10.0-linux-amd64/linux-amd64 (Clang 20, CMake, Ninja). Manifeste : torchlight_manifest.toml.
+- ./run.sh : génère, reconfigure (cmake --preset), compile, lance, affiche le FATAL du log.
+- Lancement : LD_LIBRARY_PATH=<sdk>/lib ./out/build/linux-amd64-release/torchlight --game_data_root=$PWD/assets
+  --gpu_plugin=xenos --license_mask=1 --log_file=torchlight.log (license_mask=1 : version complète, pas la démo).
+- Débogage : build debug (cmake --build --preset linux-amd64-debug), runtime librexruntimed.so. Sous gdb, toujours
+  `handle SIGSEGV nostop noprint pass` et `handle SIG35 nostop noprint pass` (le runtime rattrape les SIGSEGV des pages
+  surveillées 0xA0000000+ ; SIG35 = signal temps réel du runtime).
+- ./check_absorbed.sh (fonctions absorbées par une voisine), ./find_candidates.sh (dump gdb, propositions d'adresses :
+  surtout des adresses de retour, ne rien ajouter sans vérifier).
+Manifeste, ce qu'on a appris :
+- FATAL « invalid or unregistered function at 0x... » : ajouter `0x... = {}` dans [entrypoint.functions], régénérer,
+  puis reconfigurer (cmake --preset), sinon les sources générées ne sont pas prises en compte.
+- Fonction déclarée sans taille qui avale sa voisine : `{ end = 0x... }`. Une entrée au milieu d'une fonction la coupe
+  (REX_FATAL « Unresolved branch ») : vérifier prologue (mflr/stwu) et fin de la fonction précédente.
+- Critère fiable : aucune fonction générée ne recouvre l'entrée, et 0 « ERROR: conditional branch to unknown address ».
+- 130 petites fonctions récupérées dans les trous (llvm-mc-20 -triple=powerpc-unknown-unknown) : section en fin de
+  manifeste.
+- Logs bénins : échecs NtCreateFile (game:\music\..., game:\programs\...) et ResolvePath(SAVE:\) (le jeu essaie
+  plusieurs chemins).
+- /dev/shm/xenia_memory_* : jamais libérée en hard-exit ; /dev/shm plein => « Erreur du bus » au lancement. Supprimer
+  ceux qu'aucun processus n'ouvre (fuser) ; switch/natif_pc.sh et switch/trace_pc.sh le font.
+
+## Version Switch
+Base : le port Need for Speed MW (~/workspace/nfsmw-nx, commit 66611e3, SDK modifié dans sdk/, BSD-3 ; guide
+docs/porting-another-game.md ; son rendu natif docs/native-renderer.md, GPL-3). Rendu Vulkan via NVK
+(~/workspace/mesa-switch, branche locale `nfsmw` = 1a8c1a66d6f + patch nfsmw). Console : Atmosphère, lancer par un
+forwarder (Sphaira, recommandé : ressource système propre) ou en title override (maintenir R : ressource système du
+titre remplacé, parfois aucune), pas depuis l'album.
+
+### Chaîne d'outils
+- Docker : image devkitpro/devkita64 (utilisateur dans le groupe docker ; sinon `sg docker -c "..."`).
+- Générateur rexglue du SDK nfsmw-nx (hôte) : cmake -S ~/workspace/nfsmw-nx/sdk -B ~/workspace/nfsmw-nx/out/host -G Ninja
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 -DGIT_EXECUTABLE=/bin/false
+  -DCMAKE_C_FLAGS=-march=x86-64-v2 -DCMAKE_CXX_FLAGS=-march=x86-64-v2 ; cible rexglue
+  (GIT_EXECUTABLE=/bin/false : sinon rex_version.cmake échoue sur les tags de nfsmw-nx ; x86-64-v2 : sinon erreurs ssse3).
+- Dépendances du SDK : tools/fetch_thirdparty.py de nfsmw-nx (corrigé : liens symboliques copiés sans les suivre) ;
+  dossiers .git vides dans sdk/thirdparty/*/ (exigés par CMake). sdk/thirdparty n'est pas suivi par git.
+- Mesa NVK : sg docker -c ./build-switch.sh (branche nfsmw), puis switch/assemble_nvk_sdk.sh ->
+  ~/workspace/mesa-switch/nvk-sdk/opt/devkitpro/portlibs/switch. Pièges : partie Rust compilée pour x86-64 si
+  MESA_SWITCH_RUST_TARGET n'est pas défini (corrigé dans build-switch.sh et rustc-switch-wrapper.sh, non commité) ;
+  index de libvulkan.a à refaire avec aarch64-none-elf-ranlib (assemble_nvk_sdk.sh). Contrôle :
+  `ar x libvulkan.a && file *.o | grep -c x86-64` doit donner 0. Recompilation incrémentale : docker start
+  mesa-switch-build, ninja dans le conteneur, puis assemble_nvk_sdk.sh.
+- Modifications locales des dépôts clonés, à réappliquer si on reclone : switch/patches/ (nfsmw-sdk.patch pour sdk/,
+  glslang-verrou.patch pour sdk/thirdparty/glslang, mesa-switch-build.patch, mesa-switch-zcull-toggle.patch).
+- Code généré : switch/gen_manifest.sh (manifeste Switch depuis celui du PC, à relancer après toute modification),
+  puis cd switch && ~/workspace/nfsmw-nx/sdk/out/linux-amd64/rexglue codegen torchlight_manifest.toml (~3 min ;
+  44052 fonctions). Piège : un `includes` mal placé dans le manifeste est ignoré sans erreur.
+- Compilation : JOBS=4 switch/build_switch.sh -> switch/out/torchlight.nro (aussi l'icône : nro-icon.png à la racine,
+  versionnée). switch/carte_sd.sh -> switch/out/sd/ (.nro + torchlight.toml) et garde
+  l'ELF non strippé dans switch/elf/ (symboliser les plantages).
+- PC avec le SDK nfsmw-nx (pour développer le rendu natif) : cmake -S switch -B switch/out-pc ... -DREXSDK_DIR=
+  ~/workspace/nfsmw-nx/sdk, puis switch/natif_pc.sh [--torchlight_natif_seul=true] (lance sur une copie des données).
+  Outils de shaders (pour switch/shaders/build_lib.sh, bibliothèque de développement) : switch/out-pc/outils.
+
+### Rendu natif (switch/RENDU_NATIF.md : plan, journal de chaque essai)
+L'émulation du GPU Xenos saturait la console (~1-3 images/s puis gel). Le rendu natif redessine en Vulkan ce que le
+D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
+- src/natif/rendu.{h,cpp} : cœur Vulkan (aussi utilisé par l'outil hors ligne switch/tools/rendu_hors_ligne,
+  résultat identique à l'octet : test de non-régression sur switch/out-pc/trace-mine-6/capture).
+- src/torchlight_natif.cpp : thread du jeu = relevé de chaque image (Frame : commandes, DrawDesc, copies des
+  sommets/indices/constantes) ; thread de rendu dédié = rejeu Vulkan, présentation ; thread de compilation des shaders.
+  Threads créés par pthread depuis SetPaths (std::thread lève std::system_error sur la console, depuis un
+  thread du jeu comme depuis celui de l'interface : toujours pthread_create avec une taille de pile explicite).
+- src/torchlight_trace.cpp : interceptions des méthodes du RenderSystem (cases : switch/ogre/D3D9RenderSystem.txt).
+- Shaders : sources HLSL du jeu interceptées (D3DXCompileShader), préparées (src/natif/hlsl_prep.cpp, portage
+  de switch/shaders/prep_hlsl.py, identique à l'octet) et compilées par glslang dans le jeu (hlsl_compiler.cpp) ;
+  cache <données utilisateur>/cache/natif (*.tlsh + pipelines.bin).
+- Options : --torchlight_natif (rendu natif), --torchlight_natif_seul (les dessins ne vont plus au Direct3D du jeu),
+  --torchlight_natif_thread (thread de rendu, vrai par défaut), --torchlight_natif_ecrans=60,100 (captures d'écran),
+  --torchlight_capture_s=T (capture d'une image pour l'outil hors ligne), --torchlight_trace (traceur, lent),
+  --torchlight_manette="20:a,24:a,..." (manette de script). switch/torchlight.toml active natif et natif_seul.
+- Pièges majeurs (détails dans le journal) : Ogre 1.7 met à jour ses tampons D3D dans _render (lire après l'original) ;
+  CEGUI réécrit son tampon de sommets au même endroit dans une image ; indices d'os UBYTE4 à retourner comme un mot ;
+  décalage de profondeur (_setDepthBias, facteur -1/250000) indispensable (traînées d'ombre sinon) ; verrou global de
+  glslang réinitialisé par le SDK (corrigé par glslang-verrou.patch) ; sur la console, std::ifstream lève des
+  exceptions sur erreur de lecture, std::filesystem liste mal les dossiers, et un fichier ouvert ne peut pas être
+  renommé (sauvegardes : copie de repli dans le SDK).
+
+### Carte SD et console
+- sdmc:/switch/torchlight/ = torchlight.nro + torchlight.toml + tout le contenu de assets/. Le runtime y crée
+  torchlight/ (sauvegardes, cache) et logs/ (journaux ; logs/rex/ : rex_perfil.log, rex_crash.log, rex_pilas.txt).
+- switch/console.sh (console branchée en MTP via DBI) : etat, envoyer, pilas-on|pilas-off, journaux [--vider]
+  (-> switch-logs/), vider-cache.
+- Profil : `console.sh pilas-on` (fichier logs/rex/perfil_pilas.flag) -> rex_perfil.log contient les piles par thread,
+  et rex_pilas.txt les échantillons bruts (piles complètes, « thread|pc retours... » relatifs à l'image). Symboliser
+  avec llvm-symbolizer-20 --obj=switch/elf/<ELF du .nro testé>. Toujours `pilas-off` ensuite (ralentit le jeu).
+- Bilan [natif] toutes les 10 s dans le journal : images/s, ms par image côté jeu (image, relevé, attente du rendu),
+  thread de rendu (Vulkan, présentation), pipelines et textures créés, dessins ignorés, shaders absents.
+
+## Distribution (préparée le 2026-10-03)
+- Nom public : torchlight-nx (portage non officiel, nom du dépôt, du zip et du menu homebrew) ; dossier sur la carte :
+  sdmc:/switch/torchlight (inchangé). Icône : nro-icon.png de ce dépôt (sans lien avec le marketing du jeu).
+- Dépôt public (release GitHub) : ~/workspace/torchlight-nx, seul dépôt publié (pas de branche release ici). Un seul
+  commit sans historique (l'historique d'ici contient des captures du jeu), dont les fichiers sont ceux de main ici.
+  Après chaque commit à publier : cd ~/workspace/torchlight-nx && git fetch ~/workspace/torchlight main &&
+  git read-tree -u --reset FETCH_HEAD, puis git commit --amend -C HEAD tant que rien n'est publié (ensuite, commits
+  normaux). Vérifier : git rev-parse HEAD^{tree} égal à main^{tree} d'ici. Remote origin
+  git@github.com:liartes/torchlight-nx.git (clé ~/.ssh/id_ed25519_github, core.sshCommand local), auteur
+  Liartes <13268731+liartes@users.noreply.github.com>. Aucune trace de l'identité réelle de l'utilisateur (ni dans
+  les fichiers, ni dans le .nro : -fmacro-prefix-map, vérifier avec strings -a ... | grep -ci <nom d'utilisateur>).
+- Le joueur copie seulement torchlight.nro et son paquet XBLA dans sdmc:/switch/torchlight (torchlight.toml devient
+  facultatif : ses valeurs sont les valeurs par défaut du .nro, OnPostInitLogging de src/torchlight_app.h ; garder
+  les deux en accord).
+- switch/build_joueurs.sh : build LTO + PGO sans outils de développement (-DTORCHLIGHT_OUTILS=OFF : manette de script
+  et capture d'écran ; TORCHLIGHT_NATIF reste) dans switch/out-joueurs, puis dist/torchlight-nx-<version>.zip
+  (switch/torchlight/ : .nro, README.md, LICENSE, THIRD_PARTY_NOTICES.md). Version : TORCHLIGHT_VERSION dans
+  switch/CMakeLists.txt (1.0.0).
+- Lancement en mode applet (album) : message bloquant à l'écran (appletGetAppletType != Application) au lieu du
+  simple avertissement du SDK.
+- Le .nro contient le code de default.xex recompilé (comme les .nro de nfsmw-nx) : zone grise assumée dans le README ;
+  le dépôt, lui, ne contient ni code généré ni données du jeu.
+
+## Performances : outils et pistes
+Outils (voir le journal) :
+- Profil de la console : `console.sh pilas-on` (puis pilas-off), switch/tools/pilas.py (rex_pilas.txt + ELF de
+  switch/elf/ -> piles symbolisées, thread « Main XThread (F »), profil_arbre.py (temps inclusif/propre),
+  profil_descente.py, profil_noms.py (cases de tables virtuelles depuis les RTTI : /tmp/image.bin relue dans
+  /proc/<pid>/mem à 0x182000000, puis tools/rtti_vtables.py). Les ~30-40 premiers % des échantillons sont souvent
+  le chargement : découper par tranches. `console.sh journaux` archive rex_pilas.txt dans pilas-archive/.
+- Profil du PC : perf record --call-graph dwarf (kernel.perf_event_paranoid=1) ; temps PC peu fiables si la
+  machine est chargée (comparer en A/B alterné).
+- Fonctions natives (src/torchlight_ogre_natif.cpp, --torchlight_ogre_natif=2 : validation contre le recompilé,
+  au bit près, compteur « [ogre natif] validation ») ; memcpy/memset du jeu par l'hôte (src/torchlight_crt.cpp).
+  Après toute nouvelle interception : vérifier que le code généré n'appelle pas directement __imp__sub_X
+  (appels_directs.py fige les appels des fonctions alors non interceptées) et remettre sub_X.
+- Build Switch : appels directs, pile sans volatile (tools/pile_non_volatile.py), ordre des fonctions
+  (switch/ordre_fonctions.ld, aussi .text.hot.* pour le PGO), LTO (OUT=switch/out-lto, ~1 h), PGO :
+  build instrumentée OUT=switch/out-pgo CMAKE_OPTIONS="-DTORCHLIGHT_PGO=generer -DTORCHLIGHT_LTO=OFF", session de
+  jeu, `console.sh pgo`, puis -DTORCHLIGHT_PGO=utiliser. Le profil vaut pour le code généré exact : toute
+  régénération (gen_manifest, codegen) demande une nouvelle session. OUT est rendu absolu par build_switch.sh.
+Fait (2026-10-01/02) : cache D3DXCompileShader, Lock sans attente, géométrie reprise, interceptions sans verrous,
+registres PowerPC en variables locales + pile sans volatile (+ blocage au démarrage = course de l'anneau dans le
+SDK, corrigée), appels directs, ordre des fonctions, LTO, PGO ; en natif (au bit près) : frustum, produit de
+matrices, bindGpuProgramParameters court, KeTlsGetValue (SDK), sommets des billboards, animation des squelettes
+(nœuds, applyToNode, images clés, matrices des os), concatenateAffineMatrices, _updateAutoParams (10 types) ;
+relevé allégé (tables plates, pages vérifiées) ; lectures de pak.zip par cache de blocs de 64 Ko (64 Mo).
+Écarté : skip_lr / non_argument_as_local (section critique jamais relâchée), sauter des mises à jour d'images.
+Pistes restantes (ville, console, test n°23) : textures de rendu 207 (ombres, 5 dessins) et 208 (lumière, 40
+dessins) ~4 ms dont ~2/3 de recherche des objets visibles ; parcours de l'octree ~1,1 ms propre + 0,3 ms de
+visibilité des octants (réécriture native : ~0,5 ms, validation indirecte à prévoir) ; _updateRenderQueue des
+particules (~1 ms), de la géométrie statique (~0,8 ms) ; contrôleurs (particules, ~2 ms par image) ; accesseurs de
+matrices d'AutoParamDataSource ; régénérer l'ordre des fonctions avec pilas-archive/rex_pilas-20261002-test23.txt
+et switch/elf/torchlight-20261002-2313.elf. Gros levier restant : sortir une partie du travail d'Ogre vers un autre
+cœur (chantier lourd).
+
+## Problèmes ouverts et tâches
+- Switch, blocs mémoire du noyau épuisés (0xCE01, 2026-10-03, version joueurs sur une autre console : ville en
+  partie noire puis console figée après ville-mine-ville) : granule de confirmation porté à 2 Mo (SDK) et compteur
+  de blocs dans rex_perfil.log (ligne « nucleo: ») : corrigé et vérifié sur la console (148-164 trozos, ~1950 blocs,
+  ville affichée correctement ; journal, fin de RENDU_NATIF.md). En title override, la ressource système est celle du
+  titre remplacé (Fitness Boxing 2 : aucune) ; un forwarder (Sphaira) a la sienne. Mode TV (720p mis à l'échelle),
+  veille et bouton HOME : vérifiés sur cette console (Switch V1 Erista, mémoire à 1331 MHz : ville 25-29 images/s).
+- Switch, boutons ABXY : A/B et X/Y inversés par rapport à la manette Xbox 360 ; laissé tel quel à la demande de
+  l'utilisateur (2026-10-03), peut-être plus tard.
+- Tests sur la console restants (mode TV, veille, HOME, build des joueurs, message du mode applet et démarrage sans
+  torchlight.toml faits le 2026-10-03) : sessions longues (1-2 h) et zones lourdes (boss, niveaux profonds :
+  stabilité, mémoire, ligne « nucleo: » du profil), sauvegardes (création, chargement, suppression, quitter pendant
+  une sauvegarde).
+- Switch, icônes des boutons : remplacer les icônes Xbox 360 par des icônes au style Switch (textures
+  media/ui/icons2/widgets*.dds) : peut attendre ; l'utilisateur doute de l'intérêt sans changer la disposition des
+  boutons.
+- Installation depuis le paquet XBLA (fait le 2026-10-03, PC et Switch ; vérifié sur PC et sur la console) :
+  src/torchlight_installation.{h,cpp}, appelé par OnFinalizePaths (avant la construction du runtime, fenêtre ImGui,
+  messages en anglais à la demande de l'utilisateur). Paquet (type 0x000D0000, titre 58410A7E) cherché dans le
+  dossier du jeu et dans 58410A7E/000D0000 ; table des empreintes src/torchlight_paquet_complet.inc (SHA-256 des
+  57 fichiers de la version complète ; le jeu n'a plus de mises à jour, pas d'autre version à prévoir) ; témoin installation_paquet.txt
+  écrit en dernier. Sur la console, le dossier du .nro est pris s'il contient default.xex ou un paquet.
+  Piège : AvatarAwards (fichiers du jeu) est aussi un conteneur STFS (PIRS, type 2). Le lecteur STFS du SDK plante
+  sur un paquet tronqué : taille vérifiée avant (en-tête arrondi à 4 Ko + content_size).
+- PC, clavier virtuel (XamShowKeyboardUI, saisie du nom) : plantage intermittent, assertion ImGui `buf != NULL` dans
+  KeyboardInputDialog::OnDraw (timing dans le SDK, non confirmé).
+- PC avec l'émulation Xenos : saccades à la compilation des shaders (cache store_shaders actif, s'améliore avec le
+  temps ; -march=native sans effet).
