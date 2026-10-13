@@ -41,10 +41,16 @@
 // sans switch.h (ses types entrent en conflit avec ceux de rex).
 extern "C" {
 #include <switch/types.h>
+#include <switch/result.h>
 extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
 // AppletType de libnx (switch/services/applet.h, enum de la taille d'un int) : AppletType_Application = 0.
 int appletGetAppletType(void);
+// Langue du système (switch/services/set.h ; SetLanguage est une enum de la taille d'un int).
+Result setInitialize(void);
+void setExit(void);
+Result setGetSystemLanguage(u64* LanguageCode);
+Result setMakeLanguage(u64 LanguageCode, int* Language);
 }
 
 // Variables d'environnement du pilote Mesa/NVK, posées avant la création de Vulkan.
@@ -146,6 +152,12 @@ class TorchlightApp : public rex::ReXApp {
     SetDefault("nfsmw_io_cache_mb", "64");
     SetDefault("nfsmw_io_cache_bloque_kb", "64");
     SetDefault("nfsmw_io_rangos_mb", "0");
+    // Langue du jeu (XGetLanguage du SDK lit user_language) : celle de la console, si le jeu la propose, sauf si
+    // torchlight.toml la fixe, même à 1 (anglais, la valeur par défaut : d'où le test de la source, pas de la valeur).
+    if (const auto* info = rex::cvar::GetFlagInfo("user_language");
+        info && info->source == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("user_language", LangueDuSysteme());
+    }
     // [log.levels] krnl = "error" : des milliers d'avertissements NtCreateFile bénins, chacun écrit sur la SD.
     const auto levels =
         rex::ParseCategoryLevelsFromConfig(rex::filesystem::GetExecutableFolder() / "torchlight.toml");
@@ -154,6 +166,36 @@ class TorchlightApp : public rex::ReXApp {
   }
 
  private:
+  // Langue de la console -> XLanguage du 360 (1 anglais, 3 allemand, 4 français, 5 espagnol). Le jeu n'a que ces
+  // quatre langues (assets/translations/{de,fr,es}) : toute autre langue donne l'anglais.
+  static const char* LangueDuSysteme() {
+    const char* langue = "1";
+    int code = -1;
+    if (R_SUCCEEDED(setInitialize())) {
+      u64 lc = 0;
+      if (R_SUCCEEDED(setGetSystemLanguage(&lc)) && R_SUCCEEDED(setMakeLanguage(lc, &code))) {
+        switch (code) {
+          case 2:   // SetLanguage_FR
+          case 13:  // SetLanguage_FRCA
+            langue = "4";
+            break;
+          case 3:  // SetLanguage_DE
+            langue = "3";
+            break;
+          case 5:   // SetLanguage_ES
+          case 14:  // SetLanguage_ES419
+            langue = "5";
+            break;
+          default:
+            break;
+        }
+      }
+      setExit();
+    }
+    REXLOG_INFO("[torchlight] langue de la console {} -> langue du jeu {}", code, langue);
+    return langue;
+  }
+
   static void SetDefault(const char* name, const char* value) {
     if (rex::cvar::GetFlagInfo(name) != nullptr &&
         !rex::cvar::HasNonDefaultValue(name)) {

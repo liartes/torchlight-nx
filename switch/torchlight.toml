@@ -26,6 +26,13 @@ nfsmw_io_cache_mb = 64
 nfsmw_io_cache_bloque_kb = 64
 nfsmw_io_rangos_mb = 0
 
+# Langue du jeu : par défaut celle de la console (français, allemand, espagnol ; toute autre langue : anglais).
+# Pour la forcer : 1 anglais, 3 allemand, 4 français, 5 espagnol.
+# user_language = 4
+
+# Fond du menu principal d'après le dernier personnage joué, dès le démarrage (src/torchlight_menu_fond.cpp).
+# torchlight_menu_fond = false
+
 [log.levels]
 # Le jeu essaie plusieurs chemins pour chaque fichier (game:\music\..., game:\programs\...) :
 # des milliers d'avertissements NtCreateFile bénins, chacun écrit sur la SD en plusieurs ms.

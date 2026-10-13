@@ -1,27 +1,37 @@
 # Projet : recompilation de Torchlight (Xbox 360 XBLA) avec ReXGlue
 
-Objectif : version PC (Linux, faite) puis Switch (jouable, en cours d'optimisation).
+Objectif : version PC (Linux, faite) puis Switch (publiée : torchlight-nx 1.0.0, 2026-10-03 ; 1.0.1 préparée le
+2026-10-13).
 Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'exécutable, shaders générés en HLSL à
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
-## État et reprise (session du 2026-10-02, fin vers minuit)
+## État et reprise (session du 2026-10-03, soir)
 - Switch : jouable en rendu natif Vulkan, sauvegardes OK, clavier virtuel (swkbd), appuis fantômes corrigés.
   Performances aux fréquences de base (CPU 1020 / GPU 307,2 / mémoire 1600 MHz), test n°23 (LTO + PGO) : ville
   21,7-25 ms de rendu côté jeu (31-35 images/s sans profil, 29-30 avec), mine 17-19 ms (39-47 images/s) ; test
   n°22 (même code avant le PGO et les réécritures du soir) : 28,7 ms, 27 images/s. Mesure « image » des bilans
   [natif] = _updateAllRenderTargets seulement : la logique du jeu (~6 ms) s'y ajoute (35 images/s pour 22 ms).
-- Dernière build : switch/out-lto (LTO + PGO, profils pgo/ de la session de 30 min, pile sans volatile), avec les
-  correctifs de la suppression d'un personnage et des appuis fantômes (vérifiés sur console), et l'installation
-  depuis le paquet XBLA (2026-10-03, vérifiée sur la console : ~35 s, ~22 s après correction attendue).
+- Publié le 2026-10-03 : dépôt public https://github.com/liartes/torchlight-nx (~/workspace/torchlight-nx, commit
+  b3893eb ; release v1.0.0 avec dist/torchlight-nx-1.0.0.zip, .nro MD5 3e8f995a, créée par l'utilisateur sur GitHub).
+  Voir « Distribution ». Dernière build : switch/out-joueurs (LTO + PGO, sans outils de développement), avec le
+  correctif des blocs mémoire du noyau (granule de 2 Mo, vérifié sur la console) et sans chemins locaux dans le .nro.
+  Le README publié n'est pas à jour sur deux points, laissés tels quels par l'utilisateur : mode TV « testé seulement
+  en forcé » (testé depuis sur un vrai dock) et 30-35 images/s en ville (25-29 sur une Switch V1 Erista).
+- Consoles : principale (forwarder Sphaira, mémoire 1600 MHz) ; MTP XAJ7… = Switch V1 Erista (title override Fitness
+  Boxing 2, mémoire 1331 MHz, tests du 2026-10-03) ; MTP XJE1… = troisième console, livrable joueur installé le
+  2026-10-03 (sans torchlight.toml). Sur XJE1, le renommage en MTP échoue (« libmtp : could not get property
+  description ») : copier sous le nom final, sans .tmp + rename (console.sh le fait déjà).
 - Limite : le thread principal (Ogre ~74 %, logique ~25 %). Profil plat ; voir « Performances » pour la suite.
 - Consignes de l'utilisateur : optimiser aux fréquences de base (CPU 1020 MHz, RAM et GPU d'origine ; le surcadençage
   reste au choix du joueur) et sans rien changer au rendu (pas d'ombres une image sur deux, pas de mise à jour
   sautée : risque de clignotement). Répondre en français. Tests n°1 à 21 faits avec RAM et GPU surcadencés ;
   à partir du n°22, fréquences de base (ligne « relojes » de rex_perfil.log).
-- Pour reprendre : lire la fin du journal switch/RENDU_NATIF.md (chaque essai, mesures, pièges). En cours :
-  préparation de la distribution (section « Distribution ») ; restent les tests sur console avant distribution
-  (« Problèmes ouverts et tâches »). Ensuite possible : parcours de l'octree natif (~0,5 ms, validation difficile).
-  Boutons ABXY et icônes : laissés tels quels (choix de l'utilisateur, peut-être plus tard).
+- Pour reprendre : lire la fin du journal switch/RENDU_NATIF.md (chaque essai, mesures, pièges). Restent les tests
+  sur la console de « Problèmes ouverts et tâches » (sessions longues, zones lourdes, sauvegardes). Tout correctif
+  publié : commit sur main ici, puis synchronisation de torchlight-nx par un commit normal, push seulement à la
+  demande. Ensuite possible : parcours de l'octree natif (~0,5 ms, validation difficile), sous-allocation Vulkan des
+  textures si les blocs du noyau redeviennent justes. Boutons ABXY et icônes : laissés tels quels (choix de
+  l'utilisateur, peut-être plus tard).
 
 ## Règles
 - Sauvegarder torchlight_manifest.toml avant toute modification.
@@ -80,7 +90,8 @@ titre remplacé, parfois aucune), pas depuis l'album.
   `ar x libvulkan.a && file *.o | grep -c x86-64` doit donner 0. Recompilation incrémentale : docker start
   mesa-switch-build, ninja dans le conteneur, puis assemble_nvk_sdk.sh.
 - Modifications locales des dépôts clonés, à réappliquer si on reclone : switch/patches/ (nfsmw-sdk.patch pour sdk/,
-  glslang-verrou.patch pour sdk/thirdparty/glslang, mesa-switch-build.patch, mesa-switch-zcull-toggle.patch).
+  glslang-verrou.patch pour sdk/thirdparty/glslang, mesa-switch-build.patch, mesa-switch-zcull-toggle.patch,
+  mesa-switch-gpfifo-reserve.patch).
 - Code généré : switch/gen_manifest.sh (manifeste Switch depuis celui du PC, à relancer après toute modification),
   puis cd switch && ~/workspace/nfsmw-nx/sdk/out/linux-amd64/rexglue codegen torchlight_manifest.toml (~3 min ;
   44052 fonctions). Piège : un `includes` mal placé dans le manifeste est ignoré sans erreur.
@@ -132,8 +143,8 @@ D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
 - Dépôt public (release GitHub) : ~/workspace/torchlight-nx, seul dépôt publié (pas de branche release ici). Un seul
   commit sans historique (l'historique d'ici contient des captures du jeu), dont les fichiers sont ceux de main ici.
   Après chaque commit à publier : cd ~/workspace/torchlight-nx && git fetch ~/workspace/torchlight main &&
-  git read-tree -u --reset FETCH_HEAD, puis git commit --amend -C HEAD tant que rien n'est publié (ensuite, commits
-  normaux). Vérifier : git rev-parse HEAD^{tree} égal à main^{tree} d'ici. Remote origin
+  git read-tree -u --reset FETCH_HEAD, puis un commit normal (message en anglais) : publié sur GitHub le
+  2026-10-03 (b3893eb, release v1.0.0), plus de --amend ni de push forcé. Pousser seulement à la demande. Vérifier : git rev-parse HEAD^{tree} égal à main^{tree} d'ici. Remote origin
   git@github.com:liartes/torchlight-nx.git (clé ~/.ssh/id_ed25519_github, core.sshCommand local), auteur
   Liartes <13268731+liartes@users.noreply.github.com>. Aucune trace de l'identité réelle de l'utilisateur (ni dans
   les fichiers, ni dans le .nro : -fmacro-prefix-map, vérifier avec strings -a ... | grep -ci <nom d'utilisateur>).
@@ -143,7 +154,7 @@ D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
 - switch/build_joueurs.sh : build LTO + PGO sans outils de développement (-DTORCHLIGHT_OUTILS=OFF : manette de script
   et capture d'écran ; TORCHLIGHT_NATIF reste) dans switch/out-joueurs, puis dist/torchlight-nx-<version>.zip
   (switch/torchlight/ : .nro, README.md, LICENSE, THIRD_PARTY_NOTICES.md). Version : TORCHLIGHT_VERSION dans
-  switch/CMakeLists.txt (1.0.0).
+  switch/CMakeLists.txt (1.0.1).
 - Lancement en mode applet (album) : message bloquant à l'écran (appletGetAppletType != Application) au lieu du
   simple avertissement du SDK.
 - Le .nro contient le code de default.xex recompilé (comme les .nro de nfsmw-nx) : zone grise assumée dans le README ;
@@ -183,6 +194,36 @@ et switch/elf/torchlight-20261002-2313.elf. Gros levier restant : sortir une par
 cœur (chantier lourd).
 
 ## Problèmes ouverts et tâches
+- Version 1.0.1 préparée le 2026-10-13 (dist/torchlight-nx-1.0.1.zip, .nro MD5 926eb485, ELF
+  switch/elf/torchlight-joueurs-1.0.1-20261013-2005.elf ; texte de release dist/RELEASE-1.0.1.md) : plantage
+  « device lost » (GPFIFO de NVK, mesa-switch-gpfifo-reserve.patch), petites textures (côté <= 16 texels : poisson
+  de la pêche), langue de la console (user_language ; une valeur fixée dans torchlight.toml, même 1, est respectée :
+  test de la source du réglage), écran des succès, fond du menu dès le démarrage ; README mis à jour. Poisson à
+  revoir après une session plus longue (bug intermittent selon l'utilisateur). Publication (push, release GitHub)
+  à la demande de l'utilisateur.
+- Écran des succès du menu principal (2026-10-13, fait, vérifié sur la console : affichage, défilement, fermeture
+  par B) : XamShowAchievementsUI (stub du SDK) ouvre une fenêtre ImGui (xam_ui.cpp, nfsmw-sdk.patch) avec la liste
+  de l'AchievementManager (noms dans la langue de user_language), affichage bloquant comme la boîte de message ;
+  défilement croix/stick, A ou B ferme. Seulement depuis le menu (pas de raccourci en jeu, choix de l'utilisateur).
+- Fond du menu principal d'après le dernier personnage dès le démarrage (2026-10-13, fait, vérifié
+  sur la console : « fond du démarrage d'après SAVE:\2.TSV : trouvé ») : src/torchlight_menu_fond.cpp (interception de sub_8221DC20, option torchlight_menu_fond).
+  Le jeu construit le menu à 3,5 s, avant « Begin » (sub_82212950 état 0) : sub_8221DC20 ouvre la sauvegarde dont le
+  chemin est au champ +5388 de l'objet du jeu et y lit le niveau (fond = MAINMENURULES du niveau), sinon ville
+  (sub_82217248, mainmenu_townrules.dat 0x820AFDD8). Ce chemin (« SAVE:\0.TSV ») n'est rempli qu'en choisissant un
+  personnage et SAVE: n'est monté qu'après « Begin » : toujours la ville (probablement comme sur la Xbox).
+  L'interception retient le chemin (menu_dernier_personnage.txt) puis, au démarrage suivant, copie le fichier dans
+  menu_fond/ (données utilisateur), monte cette copie en lecture seule sous SAVE: le temps de l'appel et passe le
+  chemin au jeu. Piège : le jeu garde ce fichier ouvert ; retirer le périphérique faisait planter le SDK à « Begin »
+  (std::bad_alloc dans ContentManager::CloseOpenedFilesFromContent) : périphérique gardé, lien SAVE: retiré ; la
+  copie protège la vraie sauvegarde (fichier ouvert non remplaçable sur la console). Tracés gdb :
+  switch/tools/gdb_menu_fond.py, gdb_menu_fichier.py.
+- Switch, gels de 5-6 s sans plantage (2026-10-03 22:09 et 22:14, switch-logs-archive/20261003-2203-gels/) : thread
+  principal du jeu à 100 % CPU, thread de rendu inactif, ni E/S ni mémoire en cause. À faire : session avec
+  `console.sh pilas-on` jusqu'à un gel, puis profil de l'intervalle du gel. (Particules roses du sort de protection :
+  effet normal, vérifié sur PC contre l'émulation.) Non reproduit le 2026-10-04 : session de 74 min avec le relevé
+  des piles (build des joueurs 1.0.0), seulement deux ralentissements de chargement de zone ; au plus 2197 blocs
+  du noyau et 188 trozos, aucune erreur (switch-logs-archive/20261004-0908-longue/,
+  pilas-archive/rex_pilas-20261004-longue-joueurs100.txt). Relancer pilas-on si les gels reviennent.
 - Switch, blocs mémoire du noyau épuisés (0xCE01, 2026-10-03, version joueurs sur une autre console : ville en
   partie noire puis console figée après ville-mine-ville) : granule de confirmation porté à 2 Mo (SDK) et compteur
   de blocs dans rex_perfil.log (ligne « nucleo: ») : corrigé et vérifié sur la console (148-164 trozos, ~1950 blocs,

@@ -882,3 +882,47 @@ l'émulation GPU.
   noyau, aucune erreur (switch-logs-archive/20261003-livrable/).
 - 2026-10-03 : démarrage sans torchlight.toml vérifié sur la console (valeurs intégrées au .nro appliquées :
   mesa_env, rendu natif, cache des lectures de 64 Mo par blocs de 64 Ko, journaux krnl au niveau error).
+- 2026-10-03/04 : gels de 5-6 s sur la console XJE1 (thread principal à 100 %, rendu inactif, ni E/S ni mémoire) ;
+  non reproduits en 74 min avec le relevé des piles (switch-logs-archive/20261003-2203-gels/, 20261004-0908-longue/).
+  Particules roses du sort de protection : effet normal (émulation et rendu natif hors ligne identiques sur PC).
+- 2026-10-11 : **plantage « device lost » sur la console** (XJE1, build 1.0.0, session 014 ;
+  switch-logs-archive/20261011-plantage-device-lost/). Scène lourde (463 dessins/image, 20 Mo envoyés par image),
+  « channel 2 hit native submission pressure » en rafale (fréquent : 500 à 2800 par session, sans conséquence
+  d'habitude), puis « channel submit failed: no queue space » -> vkQueueSubmit DEVICE_LOST -> abort() du SDK
+  (VulkanCommandProcessor::BeginSubmission -> CheckSubmissionFenceAndDeviceLoss, thread GPU Commands).
+  Cause dans NVK (mesa-switch, nouveau_horizon_channel.c) : nouveau_horizon_channel_exec et enqueue_waits ne
+  réservent dans la GPFIFO (0x800 entrées) que leurs entrées + FINAL_SKID, pas la fin ajoutée par submit_locked
+  (1-2 entrées + 1 pour l'attente de l'ordre total) ; file remplie à 2042-2043 entrées -> la soumission suivante
+  échoue en NO_SPACE, sans reprise (exec_submit, lui, réservait déjà cette fin). Correctif
+  (switch/patches/mesa-switch-gpfifo-reserve.patch) : réserver cette fin aussi dans exec, enqueue_waits et
+  full_barrier ; NO_SPACE arrive alors à la mise en file, où nvkmd_switch_ctx_exec soumet le lot et réessaie.
+  Ancienne libvulkan.a gardée dans ~/workspace/mesa-switch/nvk-sdk-sauvegarde-20261011/.
+- 2026-10-11 : correctif de la GPFIFO vérifié sur la console par l'utilisateur (session sans problème).
+- 2026-10-13 : **texture du poisson de la pêche couverte de bruit** (journaux et capture d'un autre joueur, user-logs/,
+  non versionné ; rien dans les journaux : aucune texture ignorée). Poisson au bout de la ligne : media/models/fish/
+  fish.dds, DXT1 32x16. Xenos : côté le plus court <= 16 texels avec mips compactées -> le niveau de base est dans le
+  bloc des mips compactées, décalé (GetPackedMipOffset du SDK, mip 0 : 32x16 -> 16 texels en Y, 16x16 -> 16 en X).
+  Le rendu natif et la capture lisaient le niveau de base à partir de (0, 0). Correctif : décalage ajouté aux
+  coordonnées (torchlight_natif.cpp, torchlight_capture.cpp). Validation sur PC (capture pendant le sort de
+  protection, sauvegarde de la console) : avant, SPUNK.DDS (particule 16x16 DXT1) différait du niveau 0 du DDS de
+  pak.zip ; après, les 65 textures DXT de l'image sont identiques à l'octet à leur DDS, et le chargeur du rendu
+  natif donne la même empreinte que la capture. Comparaison : switch/tools/textures_dds.py <capture> assets/pak.zip
+  (chaque tex_*.bin DXT de frame.txt contre le niveau 0 du DDS de même nom).
+- 2026-10-13 : **langue du jeu d'après celle de la console.** Le jeu n'appelle que XGetLanguage (langue du tableau de
+  bord ; resources.cfg : « Only the localized zip for the current dashboard language will be searched ») ; le SDK
+  renvoyait toujours l'anglais. SDK (nfsmw-sdk.patch, xam_info.cpp) : XGetLanguage renvoie le réglage user_language
+  (déjà existant, 1 = anglais par défaut). Switch (torchlight_app.h, OnPostInitLogging) : SetDefault de
+  user_language d'après setGetSystemLanguage (fr et fr-CA -> 4, de -> 3, es et es-419 -> 5, le reste -> 1 : le jeu n'a
+  que translations/{de,fr,es}) ; torchlight.toml peut le fixer (user_language = 4). Vérifié sur PC avec
+  --user_language=3/4/5 : menus en allemand, français, espagnol (fichiers lus dans game:\translations\<langue>\).
+- 2026-10-13 : langue vérifiée sur la console (« langue de la console 2 -> langue du jeu 4 », menus et jeu en
+  français). **Écran des succès** (entrée du menu principal) : XamShowAchievementsUI ouvre une fenêtre ImGui du SDK
+  (liste de l'AchievementManager, noms traduits) ; validé sur PC (captures par xwd de la fenêtre : les captures du
+  rendu natif n'ont pas les fenêtres ImGui ; la manette de script n'agit que sur le jeu, pas sur ImGui).
+  **Fond du menu d'après le dernier personnage dès le démarrage** : src/torchlight_menu_fond.cpp (voir CLAUDE.md) ;
+  validé sur PC avec la sauvegarde de la console (mines à l'écran « Begin », puis « Continuer » sans erreur).
+  Au passage : en-têtes précompilés du SDK (switch/out-pc) périmés après une mise à jour des en-têtes système
+  (« has been modified since the precompiled header ») : supprimer les cmake_pch.hxx.pch.
+- 2026-10-13 : écran des succès et fond du menu **vérifiés sur la console** (XJE1) : liste affichée, défilement et
+  fermeture par B ; menu_dernier_personnage.txt = SAVE:\2.TSV, puis au démarrage suivant « fond du démarrage
+  d'après SAVE:\2.TSV : trouvé », « Continuer » monte ensuite la vraie sauvegarde normalement.

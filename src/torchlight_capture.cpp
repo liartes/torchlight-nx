@@ -120,15 +120,21 @@ std::string CaptureTexture(uint32_t unit, uint32_t tex, const uint8_t* base) {
   const uint32_t pitch_blocks = (fetch.pitch * 32 + fi->block_width - 1) / fi->block_width;
   uint32_t log2_bpb = 0;
   while ((1u << (log2_bpb + 1)) <= bpb) log2_bpb++;
+  // Côté le plus court <= 16 texels avec mips compactées : le niveau de base est dans le bloc des mips compactées,
+  // décalé (16x16 : 16 texels en X ; 32x16 : 16 texels en Y), comme le lit l'émulation.
+  uint32_t px = 0, py = 0, pz = 0;
+  if (info.has_packed_mips)
+    xg::texture_util::GetPackedMipOffset(width, height, 1, info.format, 0, px, py, pz);
   std::vector<uint8_t> out(size_t(bw) * bh * bpb * faces);
   for (uint32_t f = 0; f < faces; f++) {
     const uint8_t* face = src + size_t(f) * layout.base.array_slice_stride_bytes;
     uint8_t* dst = out.data() + size_t(f) * bw * bh * bpb;
     for (uint32_t y = 0; y < bh; y++) {
       for (uint32_t x = 0; x < bw; x++) {
+        const uint32_t gx = x + px, gy = y + py;
         const size_t off = info.is_tiled
-                               ? size_t(xg::texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks, log2_bpb))
-                               : size_t(y) * layout.base.row_pitch_bytes + size_t(x) * bpb;
+                               ? size_t(xg::texture_util::GetTiledOffset2D(int32_t(gx), int32_t(gy), pitch_blocks, log2_bpb))
+                               : size_t(gy) * layout.base.row_pitch_bytes + size_t(gx) * bpb;
         xg::texture_conversion::CopySwapBlock(info.endianness, &dst[(size_t(y) * bw + x) * bpb], face + off, bpb);
       }
     }

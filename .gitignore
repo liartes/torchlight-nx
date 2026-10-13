@@ -21,3 +21,9 @@ run.txt
 
 /pgo/
 /pilas-archive/
+
+# Journaux récupérés de la console (switch/console.sh journaux) et archives
+/switch-logs/
+/switch-logs-archive/
+# Journaux et captures envoyés par d'autres joueurs
+/user-logs/

@@ -574,11 +574,69 @@ index ccf5e2a..662c8e5 100644
    if (slot->repeat_state == RepeatState::kWaiting &&
        (slot->repeat_time + kRepeatDelayMs < guest_now)) {
      slot->repeat_state = RepeatState::kRepeating;
+diff --git a/sdk/src/kernel/xam/xam_info.cpp b/sdk/src/kernel/xam/xam_info.cpp
+index 1fda053..f561201 100644
+--- a/sdk/src/kernel/xam/xam_info.cpp
++++ b/sdk/src/kernel/xam/xam_info.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/cvar.h>
+ #include <rex/kernel/xam/module.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+@@ -28,6 +29,9 @@
+ #include <fmt/format.h>
+ #include <fmt/xchar.h>
+ 
++// Défini dans xam_user.cpp.
++REXCVAR_DECLARE(uint32_t, user_language);
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -183,19 +187,12 @@ u32 XGetGameRegion_entry() {
+ }
+ 
+ u32 XGetLanguage_entry() {
+-  auto desired_language = XLanguage::kEnglish;
+-
+-  // Switch the language based on game region.
+-  // TODO(benvanik): pull from xex header.
+-  uint32_t game_region = XEX_REGION_NTSCU;
+-  if (game_region & XEX_REGION_NTSCU) {
+-    desired_language = XLanguage::kEnglish;
+-  } else if (game_region & XEX_REGION_NTSCJ) {
+-    desired_language = XLanguage::kJapanese;
+-  }
+-  // Add more overrides?
+-
+-  return uint32_t(desired_language);
++  // Langue du tableau de bord : le réglage user_language (anglais par défaut), que l'application peut régler
++  // d'après la langue du système hôte. Valeur hors de XLanguage : anglais.
++  const uint32_t language = REXCVAR_GET(user_language);
++  if (language == uint32_t(XLanguage::kInvalid) || language >= uint32_t(XLanguage::kMaxLanguages))
++    return uint32_t(XLanguage::kEnglish);
++  return language;
+ }
+ 
+ u32 XamGetCurrentTitleId_entry() {
 diff --git a/sdk/src/kernel/xam/xam_ui.cpp b/sdk/src/kernel/xam/xam_ui.cpp
-index 5a572ce..c5ec02e 100644
+index 5a572ce..a3a28f9 100644
 --- a/sdk/src/kernel/xam/xam_ui.cpp
 +++ b/sdk/src/kernel/xam/xam_ui.cpp
-@@ -29,6 +29,10 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+@@ -13,6 +13,9 @@
+ #include <rex/runtime.h>
+ #include <rex/string.h>
+ #include <rex/system/flags.h>
++#include <algorithm>
++
++#include <rex/system/achievement_manager.h>
+ #include <rex/system/kernel_state.h>
+ 
+ #include <imgui.h>
+@@ -29,6 +32,10 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
  #include <rex/ui/window.h>
  #include <rex/ui/windowed_app_context.h>
  
@@ -589,7 +647,134 @@ index 5a572ce..c5ec02e 100644
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -461,9 +465,6 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+@@ -339,6 +346,126 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
+   return result;
+ }
+ 
++// Torchlight : écran des succès (entrée « Succès » du menu principal), à la place de celui du tableau de bord.
++// Liste de l'AchievementManager (noms dans la langue de user_language, déblocages sauvegardés par le runtime),
++// lue une fois à l'ouverture. Défilement à la croix ou au stick gauche ; A ou B (ou Échap) ferme, une fois
++// relâché le bouton qui a ouvert l'écran. Textes vus par le joueur : en anglais.
++class AchievementsDialog : public XamDialog {
++ public:
++  struct Entry {
++    rex::system::AchievementInfo info;
++    bool unlocked = false;
++  };
++
++  AchievementsDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::vector<Entry> entries)
++      : XamDialog(imgui_drawer), entries_(std::move(entries)) {}
++
++  void OnDraw(ImGuiIO& io) override {
++    const ImVec2 size(io.DisplaySize.x * 0.8f, io.DisplaySize.y * 0.86f);
++    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
++                            ImVec2(0.5f, 0.5f));
++    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
++    ImGui::SetNextWindowBgAlpha(0.94f);
++    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
++                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
++    // Police ProggyTiny (10 px) : agrandie selon la hauteur de l'écran (x2 en 720p), pour toute la fenêtre et
++    // sa liste (ImGui 1.92 : taille passée à PushFont).
++    const float scale = std::max(1.0f, io.DisplaySize.y / 360.0f);
++    ImGui::PushFont(nullptr, ImGui::GetFontSize() * scale);
++    if (ImGui::Begin("Achievements##xam", nullptr, flags)) {
++
++      int unlocked = 0, earned = 0, total = 0;
++      for (const Entry& e : entries_) {
++        total += int(e.info.gamerscore);
++        if (e.unlocked) {
++          unlocked++;
++          earned += int(e.info.gamerscore);
++        }
++      }
++      ImGui::Text("%d / %d unlocked", unlocked, int(entries_.size()));
++      ImGui::SameLine();
++      ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.3f, 1.0f), "%dG / %dG", earned, total);
++      ImGui::Separator();
++
++      const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
++      ImGui::BeginChild("##list", ImVec2(0.0f, -footer), false);
++      float dy = 0.0f;
++      const float speed = 500.0f * scale * io.DeltaTime;
++      if (ImGui::IsKeyDown(ImGuiKey_GamepadDpadDown) || ImGui::IsKeyDown(ImGuiKey_GamepadLStickDown) ||
++          ImGui::IsKeyDown(ImGuiKey_DownArrow))
++        dy += speed;
++      if (ImGui::IsKeyDown(ImGuiKey_GamepadDpadUp) || ImGui::IsKeyDown(ImGuiKey_GamepadLStickUp) ||
++          ImGui::IsKeyDown(ImGuiKey_UpArrow))
++        dy -= speed;
++      if (dy != 0.0f) ImGui::SetScrollY(ImGui::GetScrollY() + dy);
++      for (const Entry& e : entries_) {
++        const ImVec4 title = e.unlocked ? ImVec4(0.55f, 0.95f, 0.45f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
++        ImGui::TextColored(title, "%s %s", e.unlocked ? "[x]" : "[ ]", e.info.label.c_str());
++        ImGui::SameLine();
++        ImGui::TextColored(ImVec4(0.95f, 0.8f, 0.3f, 1.0f), "%dG", int(e.info.gamerscore));
++        const std::string& desc = e.unlocked ? e.info.description : e.info.unachieved_description;
++        if (!desc.empty()) {
++          ImGui::PushStyleColor(ImGuiCol_Text, e.unlocked ? ImVec4(0.9f, 0.9f, 0.9f, 1.0f)
++                                                          : ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
++          ImGui::TextWrapped("%s", desc.c_str());
++          ImGui::PopStyleColor();
++        }
++        ImGui::Separator();
++      }
++      ImGui::EndChild();
++
++      ImGui::TextDisabled("Press B to close");
++      ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize("Close").x - 4.0f * scale -
++                      ImGui::GetStyle().WindowPadding.x * 2.0f);
++      bool close = ImGui::Button("Close");  // écran tactile, souris
++
++      const bool down = ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) || ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) ||
++                        ImGui::IsKeyDown(ImGuiKey_Escape);
++      if (!armed_) {
++        armed_ = !down;  // le bouton qui a ouvert l'écran est peut-être encore enfoncé
++      } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
++                 ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
++                 ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
++        close = true;
++      }
++      if (close && !closing_) {
++        closing_ = true;
++        ImGui::End();
++        ImGui::PopFont();
++        Close();
++        return;
++      }
++    }
++    ImGui::End();
++    ImGui::PopFont();
++  }
++
++ private:
++  std::vector<Entry> entries_;
++  bool armed_ = false;
++  bool closing_ = false;
++};
++
++u32 XamShowAchievementsUI_entry(u32 user_index, u32 unk) {
++  REXKRNL_DEBUG("XamShowAchievementsUI({:08X}, {:08X})", uint32_t(user_index), uint32_t(unk));
++  const Runtime* emulator = REX_KERNEL_STATE()->emulator();
++  ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
++  if (REXCVAR_GET(headless) || !imgui_drawer) return X_ERROR_SUCCESS;
++  rex::system::AchievementManager& manager = REX_KERNEL_STATE()->achievements();
++  std::vector<AchievementsDialog::Entry> entries;
++  for (auto& info : manager.ListAchievements()) {
++    AchievementsDialog::Entry e;
++    e.unlocked = manager.IsUnlocked(info.id);
++    e.info = std::move(info);
++    entries.push_back(std::move(e));
++  }
++  // Affichage bloquant (comme la boîte de message sans X_OVERLAPPED) : le menu du jeu attend la fermeture, ses
++  // entrées ne voient donc pas les appuis faits dans l'écran.
++  auto close = [](AchievementsDialog*) -> X_RESULT { return X_ERROR_SUCCESS; };
++  return xeXamDispatchDialog<AchievementsDialog>(new AchievementsDialog(imgui_drawer, std::move(entries)),
++                                                 close, 0);
++}
++
+ class KeyboardInputDialog : public XamDialog {
+  public:
+   KeyboardInputDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string title,
+@@ -461,9 +588,6 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
          return X_ERROR_SUCCESS;
        }
      };
@@ -599,7 +784,7 @@ index 5a572ce..c5ec02e 100644
      // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
      std::string title_str = title
                                  ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-@@ -478,6 +479,36 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+@@ -478,6 +602,36 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                             REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
                       : "";
  
@@ -636,6 +821,15 @@ index 5a572ce..c5ec02e 100644
      if (imgui_drawer) {
        uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
        result = xeXamDispatchDialogEx<KeyboardInputDialog>(
+@@ -583,7 +737,7 @@ REX_EXPORT_STUB(__imp__XamNavigate);
+ REX_EXPORT_STUB(__imp__XamNavigateBack);
+ REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
+ REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
++REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
+ REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
+ REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 index 57fd161..9427c88 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp

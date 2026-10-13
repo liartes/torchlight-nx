@@ -1,0 +1,79 @@
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index e3f8ac8da40..5b427804391 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -801,6 +801,22 @@ nouveau_horizon_channel_reserve_entries_locked(
+    return NOUVEAU_HORIZON_SUCCESS;
+ }
+ 
++/* Entries that submit_locked appends after the pending batch: the completion
++ * tail plus the extra slot for its possible total-order wait.  Enqueue paths
++ * that do not submit themselves must keep them free, as exec_submit does;
++ * otherwise a nearly full GPFIFO accepts the batch and the next submit fails
++ * with NO_SPACE, which has no recovery path (the context reports device loss).
++ * Reporting NO_SPACE at enqueue time instead lets the caller submit the
++ * pending batch and retry.
++ */
++static uint32_t
++nouveau_horizon_channel_submit_tail_entries(
++   const struct nouveau_horizon_channel *channel)
++{
++   return (channel->mapped_completion_enabled ? 2 : 1) +
++          (channel->device->total_order_channels ? 1 : 0);
++}
++
+ static enum nouveau_horizon_status
+ nouveau_horizon_channel_append_locked(
+    struct nouveau_horizon_channel *channel,
+@@ -1772,9 +1788,16 @@ nouveau_horizon_channel_enqueue_waits(
+       return NOUVEAU_HORIZON_ERROR_INVALID_ARGUMENT;
+ 
+    mtx_lock(&channel->mutex);
+-   const enum nouveau_horizon_status status =
+-      nouveau_horizon_channel_append_waits_locked(
++   enum nouveau_horizon_status status = NOUVEAU_HORIZON_SUCCESS;
++   if (wait_count > 0) {
++      status = nouveau_horizon_channel_reserve_entries_locked(
++         channel, 1 + nouveau_horizon_channel_submit_tail_entries(channel),
++         0);
++   }
++   if (status == NOUVEAU_HORIZON_SUCCESS) {
++      status = nouveau_horizon_channel_append_waits_locked(
+          channel, wait_count, waits, false);
++   }
+    mtx_unlock(&channel->mutex);
+    return status;
+ }
+@@ -1898,8 +1921,12 @@ nouveau_horizon_channel_full_barrier(
+       return NOUVEAU_HORIZON_ERROR_INVALID_ARGUMENT;
+ 
+    mtx_lock(&channel->mutex);
+-   const enum nouveau_horizon_status status =
+-      nouveau_horizon_channel_full_barrier_locked(channel);
++   enum nouveau_horizon_status status =
++      nouveau_horizon_channel_reserve_entries_locked(
++         channel, 3 + nouveau_horizon_channel_submit_tail_entries(channel),
++         0);
++   if (status == NOUVEAU_HORIZON_SUCCESS)
++      status = nouveau_horizon_channel_full_barrier_locked(channel);
+    mtx_unlock(&channel->mutex);
+    return status;
+ }
+@@ -1921,8 +1948,15 @@ nouveau_horizon_channel_exec(
+    const uint64_t lock_start_ns = start_ns;
+    mtx_lock(&channel->mutex);
+    const uint64_t locked_ns = timing ? os_time_get_nano() : 0;
+-   const enum nouveau_horizon_status status =
+-      nouveau_horizon_channel_exec_locked(channel, exec_count, execs);
++   const uint32_t acquire_entries = channel->cache_acquire_emitted ? 0 : 2;
++   enum nouveau_horizon_status status =
++      nouveau_horizon_channel_reserve_entries_locked(
++         channel,
++         exec_count + acquire_entries +
++            nouveau_horizon_channel_submit_tail_entries(channel),
++         0);
++   if (status == NOUVEAU_HORIZON_SUCCESS)
++      status = nouveau_horizon_channel_exec_locked(channel, exec_count, execs);
+    if (timing) {
+       const uint64_t elapsed_ns = os_time_get_nano() - start_ns;
+       const uint64_t lock_wait_ns = locked_ns - lock_start_ns;

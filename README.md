@@ -49,7 +49,7 @@ Your folder then looks like this:
   torchlight.nro
   default.xex, pak.zip, ...   (the game files, installed from your package)
   installation_paquet.txt     (written once the installation is complete)
-  torchlight/                 (your saves and the shader cache)
+  torchlight/                 (your saves, achievements and the shader cache)
   logs/                       (log files)
 ```
 
@@ -63,6 +63,21 @@ Your folder then looks like this:
 
 The buttons follow the letters of the Xbox 360 controller (A is A, B is B, ...), not their positions: on the Switch,
 A and B, and X and Y, are swapped compared to the Xbox 360. The in-game prompts still show the Xbox 360 icons.
+
+## Language
+
+The game uses the language of your console when it has it: French (including Canadian French), German or Spanish
+(including Latin American Spanish). Any other console language gives English. To choose the language yourself, add
+`user_language = N` to `torchlight.toml` (see below): 1 English, 3 German, 4 French, 5 Spanish.
+
+## Achievements and main menu
+
+- **Achievements** unlock as on the Xbox 360 and are saved on the SD card (`torchlight/achievements/`). The
+  **Achievements** entry of the main menu lists them, unlocked or not: scroll with the D-pad or the left stick,
+  close with **B**. They are not linked to any online service.
+- **Main menu background:** it shows the area of the character you last played, right from the start of the game:
+  play a character once, and the next launches open on its area. `torchlight_menu_fond = false` in
+  `torchlight.toml` turns this off (the menu then starts in town, until you return to it from a game).
 
 ## Settings
 
@@ -91,7 +106,7 @@ changes in [`switch/patches/`](switch/patches):
 - **NFSMW-NX** at commit `66611e3`, with `nfsmw-sdk.patch` applied to `sdk/` and `glslang-verrou.patch` applied to
   `sdk/thirdparty/glslang`. Fetch the SDK's third-party libraries with its `tools/fetch_thirdparty.py`.
 - **[mesa-switch](https://github.com/danfromtico/mesa-switch)** at `1a8c1a66d6f` with NFSMW-NX's Mesa patch and
-  `mesa-switch-build.patch` / `mesa-switch-zcull-toggle.patch`, built with its `build-switch.sh` (Docker), then
+  `mesa-switch-build.patch` / `mesa-switch-zcull-toggle.patch` / `mesa-switch-gpfifo-reserve.patch`, built with its `build-switch.sh` (Docker), then
   `switch/assemble_nvk_sdk.sh`.
 - **Docker** with the `devkitpro/devkita64` image, and clang 20, CMake and Ninja on the host (for the code
   generator).
