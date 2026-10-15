@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -52,6 +53,16 @@ float LoadFloat(const uint8_t* base, uint32_t addr) {
 }
 
 std::atomic<uint64_t> g_calls{0}, g_diffs{0}, g_billboards{0}, g_billboards_original{0};
+
+// Validation du parcours de l'octree (sub_821C7158, en fin de fichier) : événements (visibilités d'octants, tests de
+// boîtes) relevés par les interceptions de sub_821C0E78 et sub_821C74A0 pendant l'original, seulement pour les appels
+// faits par le parcours lui-même (pointeur de pile de son cadre), comparés à ceux du parcours à blanc.
+thread_local std::vector<uint32_t>* g_octree_events = nullptr;
+thread_local uint32_t g_octree_sp = 0;
+
+void OctreeEvent(const PPCContext& ctx, std::initializer_list<uint32_t> event) {
+  if (g_octree_events && ctx.r1.u32 == g_octree_sp) g_octree_events->insert(g_octree_events->end(), event);
+}
 std::atomic<int64_t> g_last_report{0};
 
 void Report() {
@@ -127,17 +138,18 @@ void Store32(uint8_t* base, uint32_t addr, uint32_t value) {
 }
 
 // Successeur dans un arbre std::map MSVC (comme sub_8262D6C8) : nœud { gauche +0, parent +4, droite +8, ...,
-// _Isnil (octet) +21 }.
+// _Isnil (octet) +21 } ; std::set d'un pointeur (sub_824C6960) : _Isnil en +17.
+template <uint32_t kIsNil = 21>
 uint32_t TreeNext(const uint8_t* base, uint32_t node) {
-  if (base[node + 21]) return node;
+  if (base[node + kIsNil]) return node;
   uint32_t right = Load32(base, node + 8);
-  if (!base[right + 21]) {
+  if (!base[right + kIsNil]) {
     uint32_t n = right;
-    for (uint32_t left = Load32(base, n); !base[left + 21]; left = Load32(base, n)) n = left;
+    for (uint32_t left = Load32(base, n); !base[left + kIsNil]; left = Load32(base, n)) n = left;
     return n;
   }
   uint32_t parent = Load32(base, node + 4);
-  while (!base[parent + 21] && node == Load32(base, parent + 8)) {
+  while (!base[parent + kIsNil] && node == Load32(base, parent + 8)) {
     node = parent;
     parent = Load32(base, parent + 4);
   }
@@ -404,9 +416,11 @@ REX_HOOK_RAW(sub_821C74A0) {
     __imp__sub_821C74A0(ctx, base);
     return;
   }
-  const bool visible = BoxVisible(base, ctx.r3.u32, ctx.r4.u32);
+  const uint32_t box = ctx.r4.u32;
+  const bool visible = BoxVisible(base, ctx.r3.u32, box);
   if (mode == 2) {
     __imp__sub_821C74A0(ctx, base);
+    OctreeEvent(ctx, {2u, box, ctx.r3.u32 ? 1u : 0u});
     g_calls.fetch_add(1, std::memory_order_relaxed);
     if ((ctx.r3.u32 != 0) != visible) g_diffs.fetch_add(1, std::memory_order_relaxed);
     Report();
@@ -1295,4 +1309,592 @@ REX_HOOK_RAW(sub_82201EB0) {
     std::memcpy(base + cb, original.data(), original.size());
   }
   Report();
+}
+
+// --- Parcours de l'octree (sub_821C7158 : OctreeSceneManager::walkOctree, variante Xbox) ---
+// Console (2026-10-15, lot 2) : 4 à 7 % du thread principal en temps propre en ville et dans la mine.
+// r3 caméra, r4 file de rendu, r5 octant racine. Parcours itératif sur une pile explicite en mémoire du jeu
+// (0x83582C00, premiers 128 octets mis à zéro par dcbzl ; entrée = octant | 1 si entièrement visible). Pour chaque
+// octant non vide (+96 : nombre de nœuds, enfants compris) : visibilité (sub_821C7000 : limites élargies ;
+// sub_821C0E78 : 0 aucune, 1 partielle, 2 complète) sauf si entièrement visible ; nœuds de scène (std::list +80 :
+// suivant +0, nœud +8) : dans un octant partiel, boîte du nœud (+356) contre le frustum (BoxVisible, sur
+// mCullFrustum +1224 de la caméra s'il existe) ; dans un octant complet, le résultat du dernier test est gardé
+// (r18 du jeu, 1 au départ : reproduit tel quel). Objets du nœud (liste +312 : suivant +0, objet +36) :
+// isVisible [26], puis _notifyCurrentCamera [18] (caméra) et _updateRenderQueue [23] (file). Puis les 8 enfants
+// (+48..+76) empilés dans l'ordre, avec le drapeau si l'octant est entièrement visible.
+// Validation (mode 2) : parcours natif « à blanc » (sans _notifyCurrentCamera ni _updateRenderQueue) avant
+// l'original ; mêmes visibilités d'octants, mêmes tests de boîtes (adresse, résultat), même contenu de la pile.
+REX_EXTERN(__imp__sub_821C7158);
+REX_EXTERN(__imp__sub_821C7000);
+REX_EXTERN(__imp__sub_821C0E78);
+REX_EXTERN(__imp__sub_821C3660);  // MovableObject::isVisible (cas courant)
+REX_EXTERN(__imp__sub_821C7088);
+REX_EXTERN(__imp__sub_821C0B20);  // MovableObject::_notifyCurrentCamera
+REX_EXTERN(__imp__sub_821BE5A8);  // _updateRenderQueue (cas courant)
+
+namespace {
+
+constexpr uint32_t kOctreeStack = 0x83582C00;
+constexpr uint32_t kInfinity = 0x8356C9C8;    // lis -31913 ; lfs -13880
+constexpr uint32_t kZeroVector = 0x8355A3BC;  // Vector3::ZERO
+
+struct Box {
+  float min[3], max[3];
+  uint32_t extent;
+};
+
+// sub_821C7000(r3 octant, r4 boîte) : Octree::_getCullBounds, mBox (+0 minimum, +12 maximum) élargie de mHalfSize
+// (+36), puis sub_821C7698 (setExtents de la variante Xbox : étendue finie, et un minimum plus grand que le maximum
+// devient maximum - constante +264).
+Box OctantCullBounds(const uint8_t* base, uint32_t node) {
+  Box b;
+  for (int i = 0; i < 3; i++) {
+    const float h = LoadFloat(base, node + 36 + 4 * i);
+    b.min[i] = LoadFloat(base, node + 4 * i) - h;
+    b.max[i] = LoadFloat(base, node + 12 + 4 * i) + h;
+  }
+  b.extent = 1;
+  const float eps = LoadFloat(base, kConstants + 264);
+  for (int i = 0; i < 3; i++)
+    if (b.min[i] > b.max[i]) b.min[i] = b.max[i] - eps;
+  return b;
+}
+
+Box LoadBox(const uint8_t* base, uint32_t box) {
+  Box b;
+  for (int i = 0; i < 3; i++) {
+    b.min[i] = LoadFloat(base, box + 4 * i);
+    b.max[i] = LoadFloat(base, box + 12 + 4 * i);
+  }
+  b.extent = Load32(base, box + 24);
+  return b;
+}
+
+// sub_821C0E78(r3 caméra, r4 boîte) : OctreeCamera::getVisibility. Plans par getFrustumPlane [91] (le plan 1, le
+// lointain, est sauté si mFarDist +228 est nul). Opérations dans l'ordre du jeu (fmuls, fabs, fmadds, fadds).
+int Visibility(PPCContext& ctx, uint8_t* base, uint32_t cam, const Box& b) {
+  if (b.extent == 0) return 0;
+  const float half = LoadFloat(base, kConstants + 104), zero = LoadFloat(base, kConstants + 68);
+  const float cy = (b.max[1] + b.min[1]) * half, cz = (b.max[2] + b.min[2]) * half;
+  const float cx = (b.min[0] + b.max[0]) * half;
+  float hx, hy, hz;
+  if (b.extent == 1) {
+    hx = (b.max[0] - b.min[0]) * half;
+    hy = (b.max[1] - b.min[1]) * half;
+    hz = (b.max[2] - b.min[2]) * half;
+  } else if (b.extent == 2) {
+    hx = hy = hz = LoadFloat(base, kInfinity);
+  } else {
+    hx = LoadFloat(base, kZeroVector);
+    hy = LoadFloat(base, kZeroVector + 4);
+    hz = LoadFloat(base, kZeroVector + 8);
+  }
+  const uint32_t get_plane = Slot(base, cam, 364);
+  bool inside = true;
+  for (uint32_t i = 0; i < 6; i++) {
+    if (i == 1 && LoadFloat(base, cam + 228) == zero) continue;
+    const uint32_t p = CallGuest(ctx, base, get_plane, cam, i);
+    const float nx = LoadFloat(base, p), ny = LoadFloat(base, p + 4), nz = LoadFloat(base, p + 8);
+    const float d = LoadFloat(base, p + 12);
+    const float ay = std::fabs(ny * hy), ax = std::fabs(nx * hx), az = std::fabs(nz * hz);
+    const float dist = FmaLikeGuest(ny, cy, FmaLikeGuest(nx, cx, nz * cz)) + d;
+    const float extent = (ay + ax) + az;
+    if (dist < -extent) return 0;
+    if (!(dist > extent)) inside = false;
+  }
+  return inside ? 2 : 1;
+}
+
+// Appel virtuel du parcours (r3 objet, r4) ; les cibles courantes appelées directement (comme les appels promus).
+uint32_t CallObject(PPCContext& ctx, uint8_t* base, uint32_t func, uint32_t obj, uint32_t r4) {
+  ctx.r3.u64 = obj;
+  ctx.r4.u64 = r4;
+  switch (func) {
+    case 0x821C3660: __imp__sub_821C3660(ctx, base); break;
+    case 0x821C7088: __imp__sub_821C7088(ctx, base); break;
+    case 0x821C0B20: __imp__sub_821C0B20(ctx, base); break;
+    case 0x821BE5A8: __imp__sub_821BE5A8(ctx, base); break;
+    default: GuestFunc(base, func)(ctx, base); break;
+  }
+  return ctx.r3.u32;
+}
+
+// Parcours ; dry : à blanc (validation) : pile dans `dry_stack`, sans _notifyCurrentCamera ni _updateRenderQueue.
+void WalkOctree(PPCContext& ctx, uint8_t* base, uint32_t cam, uint32_t queue, uint32_t root,
+                std::vector<uint32_t>* events, std::vector<uint32_t>* dry_stack) {
+  const uint32_t old_sp = ctx.r1.u32, sp = old_sp - 256;
+  Store32(base, sp, old_sp);
+  ctx.r1.u64 = sp;
+  const uint32_t cull = Load32(base, cam + 1224);
+  const uint32_t planes = cull ? cull : cam;
+  auto store = [&](uint32_t i, uint32_t v) {
+    if (dry_stack) {
+      if (dry_stack->size() <= i) dry_stack->resize(i + 1, 0);
+      (*dry_stack)[i] = v;
+    } else {
+      Store32(base, kOctreeStack + 4 * i, v);
+    }
+  };
+  auto load = [&](uint32_t i) { return dry_stack ? (*dry_stack)[i] : Load32(base, kOctreeStack + 4 * i); };
+  if (dry_stack) {
+    dry_stack->assign(32, 0);
+  } else {
+    std::memset(base + kOctreeStack, 0, 128);
+  }
+  store(0, root);
+  uint32_t top = 1;
+  bool box_visible = true;  // r18
+  while (top) {
+    const uint32_t entry = load(--top), node = entry & ~1u;
+    if (top) {  // dcbt du jeu : octant suivant
+      const uint8_t* next = base + (load(top - 1) & ~1u);
+      __builtin_prefetch(next);
+      __builtin_prefetch(next + 64);
+    }
+    if (Load32(base, node + 96) == 0) continue;
+    int vis = 2;
+    if (!(entry & 1)) {
+      vis = Visibility(ctx, base, cam, OctantCullBounds(base, node));
+      if (events) events->insert(events->end(), {1u, uint32_t(vis)});
+      if (vis == 0) continue;
+    }
+    const uint32_t flag = vis == 2 ? 1 : 0;
+    const uint32_t nodes = Load32(base, node + 80);
+    for (uint32_t it = Load32(base, nodes); it != nodes; it = Load32(base, it)) {
+      const uint32_t scene_node = Load32(base, it + 8);
+      __builtin_prefetch(base + scene_node + 356);
+      __builtin_prefetch(base + scene_node + 312);
+      if (vis == 1) {
+        box_visible = BoxVisible(base, planes, scene_node + 356);
+        if (events) events->insert(events->end(), {2u, scene_node + 356, box_visible ? 1u : 0u});
+      }
+      if (!box_visible) continue;
+      const uint32_t objects = Load32(base, scene_node + 312);
+      for (uint32_t o = Load32(base, objects); o != objects; o = Load32(base, o)) {
+        const uint32_t obj = Load32(base, o + 36);
+        __builtin_prefetch(base + Load32(base, o) + 36);
+        if (!(CallObject(ctx, base, Slot(base, obj, 104), obj, 0) & 0xFF) || dry_stack) continue;
+        CallObject(ctx, base, Slot(base, obj, 72), obj, cam);
+        CallObject(ctx, base, Slot(base, obj, 92), obj, queue);
+      }
+    }
+    for (uint32_t k = 0; k < 8; k++) {
+      const uint32_t child = Load32(base, node + 48 + 4 * k);
+      if (child) store(top++, child | flag);
+    }
+  }
+  ctx.r1.u64 = old_sp;
+}
+
+uint64_t g_octree_walks = 0, g_octree_diffs = 0, g_octree_compared = 0;
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821C7158) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821C7158(ctx, base);
+  const uint32_t cam = ctx.r3.u32, queue = ctx.r4.u32, root = ctx.r5.u32;
+  if (mode == 1) return WalkOctree(ctx, base, cam, queue, root, nullptr, nullptr);
+  std::vector<uint32_t> expected, seen, stack;
+  WalkOctree(ctx, base, cam, queue, root, &expected, &stack);
+  g_octree_events = &seen;
+  g_octree_sp = ctx.r1.u32 - 256;
+  ctx.r3.u64 = cam;
+  ctx.r4.u64 = queue;
+  ctx.r5.u64 = root;
+  __imp__sub_821C7158(ctx, base);
+  g_octree_events = nullptr;
+  bool same = seen == expected;
+  g_octree_compared += expected.size() + stack.size();
+  for (uint32_t i = 0; same && i < stack.size(); i++) same = Load32(base, kOctreeStack + 4 * i) == stack[i];
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  if (!same) g_diffs.fetch_add(1, std::memory_order_relaxed);
+  if (!same && g_octree_diffs++ < 8)
+    REXLOG_ERROR("[ogre natif] parcours de l'octree : différence ({} événements natifs, {} de l'original)",
+                 expected.size(), seen.size());
+  if (++g_octree_walks % 2000 == 0)
+    REXLOG_INFO("[ogre natif] parcours de l'octree : {} parcours validés ({} mots comparés), {} différences",
+                g_octree_walks, g_octree_compared, g_octree_diffs);
+  Report();
+}
+
+REX_HOOK_RAW(sub_821C7000) {
+  const int mode = Mode();
+  const uint32_t node = ctx.r3.u32, box = ctx.r4.u32;
+  if (mode == 0) return __imp__sub_821C7000(ctx, base);
+  const Box b = OctantCullBounds(base, node);
+  uint32_t words[7];
+  for (int i = 0; i < 3; i++) {
+    words[i] = FloatBits(b.min[i]);
+    words[3 + i] = FloatBits(b.max[i]);
+  }
+  words[6] = b.extent;
+  if (mode == 2) {
+    __imp__sub_821C7000(ctx, base);
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < 7; i++) {
+      if (Load32(base, box + 4 * i) != words[i]) {
+        g_diffs.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+    }
+    Report();
+    return;
+  }
+  for (int i = 0; i < 7; i++) Store32(base, box + 4 * i, words[i]);
+  ctx.r3.u64 = box;
+}
+
+REX_HOOK_RAW(sub_821C0E78) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821C0E78(ctx, base);
+  const uint32_t cam = ctx.r3.u32, box = ctx.r4.u32;
+  if (mode == 1) {
+    ctx.r3.u64 = uint32_t(Visibility(ctx, base, cam, LoadBox(base, box)));
+    return;
+  }
+  const int vis = Visibility(ctx, base, cam, LoadBox(base, box));
+  ctx.r3.u64 = cam;
+  ctx.r4.u64 = box;
+  __imp__sub_821C0E78(ctx, base);
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  if (ctx.r3.u32 != uint32_t(vis)) g_diffs.fetch_add(1, std::memory_order_relaxed);
+  OctreeEvent(ctx, {1u, ctx.r3.u32});
+  Report();
+}
+
+// --- Largeur d'un texte de CEGUI (sub_821B3DA0 : Font::getTextExtent de la variante du jeu) ---
+// Console (2026-10-15) : ~40 % du thread principal dans la scène du PNJ donneur de quête (18 images/s), appelée par
+// la mise en page des textes (retours à la ligne) pour chaque mot. r3 police, r4 texte (CEGUI::String : longueur +0,
+// réserve +4, caractères UTF-32 en +20 si la réserve est d'au plus 32, sinon pointeur en +148), f1 échelle. L'original
+// convertit le texte et les deux balises de la police (CEGUI::String +724 et +876) en UTF-8 (c_str, tampon de la
+// chaîne), puis en std::string, puis en std::wstring (MultiByteToWideChar, sub_821B36A8 -> sub_821B3780 :
+// ConvertUTF8toUTF16 permissif d'Unicode Inc.), à chaque appel. Pour des points de code de 1 à 0xFFFF, l'aller-retour
+// est l'identité (un 0 tronquerait la std::string, au-delà de 0xFFFF une paire de substitution changerait les
+// indices) : la native lit directement les points de code ; sinon, l'original. Les allocations temporaires et le
+// tampon UTF-8 des chaînes (cache reconstruit par chaque c_str) ne sont plus faits.
+// Balises (si l'octet +1028 de la police est non nul et que le texte contient un caractère de l'une d'elles :
+// sub_821A5CE0, find_first_of) : à l'indice i, balise 1 suivie de 8 caractères sautée, sinon balise 2 sautée
+// (comparaison sub_821B39E0, wcsncmp du jeu). Largeur : max(x + (largeur + décalage de l'image) * échelle), x avancé
+// de advance * échelle (fmadds).
+REX_EXTERN(__imp__sub_821B3DA0);
+REX_EXTERN(__imp__sub_821B3C88);
+
+namespace {
+
+// Caractères UTF-32 d'une CEGUI::String ; faux si un point de code est hors de 1..0xFFFF.
+bool CeguiChars(const uint8_t* base, uint32_t str, std::vector<uint16_t>& out) {
+  const uint32_t len = Load32(base, str);
+  const uint32_t data = Load32(base, str + 4) > 32 ? Load32(base, str + 148) : str + 20;
+  out.resize(len + 1);
+  for (uint32_t i = 0; i < len; i++) {
+    const uint32_t c = Load32(base, data + 4 * i);
+    if (c - 1 >= 0xFFFF) return false;
+    out[i] = uint16_t(c);
+  }
+  out[len] = 0;
+  return true;
+}
+
+// sub_821B39E0 : wcsncmp du jeu (n nul : égal).
+int GuestWcsncmp(const uint16_t* a, const uint16_t* b, uint32_t n) {
+  if (n == 0) return 0;
+  for (uint32_t k = n - 1; k && *a && *a == *b; k--) {
+    a++;
+    b++;
+  }
+  return int(*a) - int(*b);
+}
+
+bool AnyOf(const std::vector<uint16_t>& text, const std::vector<uint16_t>& chars) {
+  for (size_t i = 0; i + 1 < text.size(); i++)
+    for (size_t k = 0; k + 1 < chars.size(); k++)
+      if (text[i] == chars[k]) return true;
+  return false;
+}
+
+// sub_821B3C88(r3 police, r4 point de code) : Font::getGlyphData. Au-delà de +524 : aucun. Pages de 256 points de
+// code chargées à la demande (bits en +720 ; sinon bit posé puis rasterize [3] (police, début, fin) du jeu), puis
+// recherche dans la std::map des glyphes (en-tête +24 ; nœud : gauche +0, parent +4, droite +8, clé +12, valeur +16,
+// isnil +25). Rend l'adresse du FontGlyph (image +0, avance +4) ou 0.
+uint32_t GlyphData(PPCContext& ctx, uint8_t* base, uint32_t font, uint32_t cp) {
+  if (cp > Load32(base, font + 524)) return 0;
+  if (const uint32_t bits = Load32(base, font + 720)) {
+    const uint32_t word = bits + (cp >> 13) * 4, bit = 1u << ((cp >> 8) & 31);
+    if (!(Load32(base, word) & bit)) {
+      Store32(base, word, Load32(base, word) | bit);
+      CallGuest(ctx, base, Slot(base, font, 12), font, cp & ~0xFFu, cp | 0xFFu);
+    }
+  }
+  const uint32_t head = Load32(base, font + 24);
+  uint32_t lb = head;
+  for (uint32_t n = Load32(base, head + 4); !base[n + 25];) {
+    if (Load32(base, n + 12) < cp) {
+      n = Load32(base, n + 8);
+    } else {
+      lb = n;
+      n = Load32(base, n);
+    }
+  }
+  if (lb == head || cp < Load32(base, lb + 12)) return 0;
+  return lb + 16;
+}
+
+thread_local bool g_text_tags = false;  // validation : le dernier texte avait des balises
+
+bool TextExtent(PPCContext& ctx, uint8_t* base, uint32_t font, uint32_t text, double scale, float& result) {
+  thread_local std::vector<uint16_t> w, tag1, tag2;
+  if (!CeguiChars(base, text, w) || !CeguiChars(base, font + 724, tag1) || !CeguiChars(base, font + 876, tag2))
+    return false;
+  const uint32_t len = uint32_t(w.size() - 1), len1 = uint32_t(tag1.size() - 1), len2 = uint32_t(tag2.size() - 1);
+  const uint32_t data = Load32(base, text + 4) > 32 ? Load32(base, text + 148) : text + 20;
+  const bool tags = base[font + 1028] && (AnyOf(w, tag1) || AnyOf(w, tag2));
+  g_text_tags = tags;
+  float x = LoadFloat(base, kConstants + 68), extent = x;
+  for (uint32_t i = 0; i < len; i++) {
+    if (tags) {
+      if (i + len1 + 8 <= len && GuestWcsncmp(&w[i], tag1.data(), len1) == 0)
+        i += len1 + 8;
+      else if (i + len2 <= len && GuestWcsncmp(&w[i], tag2.data(), len2) == 0)
+        i += len2;
+      if (i >= len) continue;
+    }
+    const uint32_t glyph = GlyphData(ctx, base, font, Load32(base, data + 4 * i));
+    if (!glyph) continue;
+    const uint32_t image = Load32(base, glyph);
+    const float right = float(double(LoadFloat(base, image + 36) + LoadFloat(base, image + 28)) * scale) + x;
+    if (right > extent) extent = right;
+    x = float(std::fma(double(LoadFloat(base, glyph + 4)), scale, double(x)));
+  }
+  result = x < extent ? extent : x;
+  return true;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821B3DA0) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821B3DA0(ctx, base);
+  const uint32_t font = ctx.r3.u32, text = ctx.r4.u32;
+  const double scale = ctx.f1.f64;
+  float result;
+  if (mode == 1) {
+    if (TextExtent(ctx, base, font, text, scale, result)) {
+      ctx.f1.f64 = double(result);
+    } else {
+      ctx.r3.u64 = font;
+      ctx.r4.u64 = text;
+      ctx.f1.f64 = scale;
+      __imp__sub_821B3DA0(ctx, base);
+    }
+    return;
+  }
+  // Validation : l'original d'abord (il charge les pages de glyphes manquantes), puis la native.
+  static uint64_t validated = 0, fallback = 0, diffs = 0, tagged = 0;
+  __imp__sub_821B3DA0(ctx, base);
+  const double original = ctx.f1.f64;
+  if (TextExtent(ctx, base, font, text, scale, result)) {
+    validated++;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (g_text_tags) tagged++;
+    const double native = double(result);
+    if (std::memcmp(&original, &native, 8) != 0) {
+      g_diffs.fetch_add(1, std::memory_order_relaxed);
+      if (diffs++ < 8) REXLOG_ERROR("[ogre natif] largeur de texte : {} au lieu de {}", native, original);
+    }
+  } else {
+    fallback++;
+  }
+  if ((validated + fallback) % 20000 == 0)
+    REXLOG_INFO("[ogre natif] largeur de texte : {} validées ({} avec balises), {} par l'original, {} différences",
+                validated, tagged, fallback, diffs);
+  ctx.f1.f64 = original;
+  Report();
+}
+
+REX_HOOK_RAW(sub_821B3C88) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821B3C88(ctx, base);
+  const uint32_t font = ctx.r3.u32, cp = ctx.r4.u32;
+  if (mode == 1) {
+    ctx.r3.u64 = GlyphData(ctx, base, font, cp);
+    return;
+  }
+  __imp__sub_821B3C88(ctx, base);
+  const uint32_t original = ctx.r3.u32;
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  if (GlyphData(ctx, base, font, cp) != original) g_diffs.fetch_add(1, std::memory_order_relaxed);
+  ctx.r3.u64 = original;
+  Report();
+}
+
+// --- Contrôleurs (sub_821C8C00 : ControllerManager::updateAllControllers) ---
+// Console (2026-10-15) : 1,6 % du thread principal en temps propre (7,6 % avec les particules). Une fois par image
+// (Root +224 : numéro de l'image suivante, comparé à +56) : pour chaque contrôleur du std::set (en-tête +8 ; nœud :
+// valeur +12, isnil +17) actif (+52), valeur = source (+8) getValue [1], puis fonction (+40) calculate [1], puis
+// destination (+24) setValue [2]. Cas courants en natif (99,9 % des appels d'après le relevé des appels indirects) :
+// source FrameTimeControllerValue (sub_821C8BF8 : +8), fonctions sub_821C8CD8 (getAdjustedInput) et sub_821D2EE0
+// (entrée multipliée par +12, puis getAdjustedInput), destination sub_821D2E50 (modificateur de coordonnées de
+// texture) ; ParticleSystemUpdateValue (sub_821C8A58) et les autres restent ceux du jeu.
+// Validation (mode 2) : chaque calcul natif comparé à la fonction du jeu sur le même état (sauvegardé puis remis),
+// successeur dans l'arbre comparé à sub_824C6960.
+REX_EXTERN(__imp__sub_821C8C00);
+REX_EXTERN(__imp__sub_821C8A58);
+REX_EXTERN(__imp__sub_821C8CD8);
+REX_EXTERN(__imp__sub_821D2EE0);
+REX_EXTERN(__imp__sub_821D2E50);
+REX_EXTERN(__imp__sub_824C6960);
+
+namespace {
+
+constexpr uint32_t kTwoPi = 0x8356C9CC;  // lis -31913 ; lfs -13876
+
+// sub_821E8398(r3 fonction, f1) : ControllerFunction::getAdjustedInput. Avec mDeltaInput (+4), valeur (+8) cumulée et
+// ramenée dans [0, 1) par pas de 1.0 (soustraction en double, arrondie), comme le jeu.
+double AdjustedInput(uint8_t* base, uint32_t func, double input) {
+  if (!base[func + 4]) return input;
+  float v = float(double(LoadFloat(base, func + 8)) + input);
+  StoreFloat(base, func + 8, v);
+  const float one = LoadFloat(base, kConstants + 64), zero = LoadFloat(base, kConstants + 68);
+  const double step = LoadDouble(base, kConstants);
+  if (!(v < one)) {
+    do {
+      v = float(double(LoadFloat(base, func + 8)) - step);
+      StoreFloat(base, func + 8, v);
+    } while (!(v < one));
+  }
+  if (LoadFloat(base, func + 8) < zero) {
+    do {
+      v = float(double(LoadFloat(base, func + 8)) + step);
+      StoreFloat(base, func + 8, v);
+    } while (v < zero);
+  }
+  return double(LoadFloat(base, func + 8));
+}
+
+// sub_821D2E50(r3 valeur, f1) : translations U/V (+4, +5), échelles U/V (+6, +7), rotation (+8, multipliée par 2π) de
+// l'unité de texture (+12 : champs +212..+228, recalcul de la matrice +211).
+void TexCoordModifier(uint8_t* base, uint32_t self, double value) {
+  for (uint32_t k = 0; k < 4; k++) {
+    if (!base[self + 4 + k]) continue;
+    const uint32_t tus = Load32(base, self + 12);
+    StoreFloat(base, tus + 212 + 4 * k, float(value));
+    base[tus + 211] = 1;
+  }
+  if (base[self + 8]) {
+    const uint32_t tus = Load32(base, self + 12);
+    StoreFloat(base, tus + 228, float(double(LoadFloat(base, kTwoPi)) * value));
+    base[tus + 211] = 1;
+  }
+}
+
+uint64_t BitsOf(double d) {
+  uint64_t bits;
+  std::memcpy(&bits, &d, 8);
+  return bits;
+}
+
+void Diff() { g_diffs.fetch_add(1, std::memory_order_relaxed); }
+
+// Fonction du contrôleur ; validation : calcul natif sur l'état sauvegardé, état remis, puis la fonction du jeu.
+double ControllerFunction(PPCContext& ctx, uint8_t* base, uint32_t func, uint32_t entry, double input, bool check) {
+  auto native = [&]() {
+    return entry == 0x821C8CD8 ? AdjustedInput(base, func, input)
+                               : AdjustedInput(base, func, double(float(double(LoadFloat(base, func + 12)) * input)));
+  };
+  if ((entry == 0x821C8CD8 || entry == 0x821D2EE0) && !check) return native();
+  const uint32_t saved = Load32(base, func + 8);
+  double expected = 0;
+  uint32_t expected_state = 0;
+  const bool known = entry == 0x821C8CD8 || entry == 0x821D2EE0;
+  if (known) {
+    expected = native();
+    expected_state = Load32(base, func + 8);
+    Store32(base, func + 8, saved);
+  }
+  ctx.r3.u64 = func;
+  ctx.f1.f64 = input;
+  if (entry == 0x821C8CD8)
+    __imp__sub_821C8CD8(ctx, base);
+  else if (entry == 0x821D2EE0)
+    __imp__sub_821D2EE0(ctx, base);
+  else
+    GuestFunc(base, entry)(ctx, base);
+  if (known) {
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (BitsOf(ctx.f1.f64) != BitsOf(expected) || Load32(base, func + 8) != expected_state) Diff();
+  }
+  return ctx.f1.f64;
+}
+
+void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t dest, uint32_t entry, double value, bool check) {
+  if (entry == 0x821D2E50 && !check) return TexCoordModifier(base, dest, value);
+  uint8_t saved[24], expected[24];
+  const uint32_t tus = Load32(base, dest + 12);
+  const bool known = entry == 0x821D2E50 && tus;
+  if (known) {
+    std::memcpy(saved, base + tus + 208, 24);
+    TexCoordModifier(base, dest, value);
+    std::memcpy(expected, base + tus + 208, 24);
+    std::memcpy(base + tus + 208, saved, 24);
+  }
+  ctx.r3.u64 = dest;
+  ctx.f1.f64 = value;
+  if (entry == 0x821D2E50)
+    __imp__sub_821D2E50(ctx, base);
+  else if (entry == 0x821C8A58)
+    __imp__sub_821C8A58(ctx, base);
+  else
+    GuestFunc(base, entry)(ctx, base);
+  if (known) {
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (std::memcmp(base + tus + 208, expected, 24) != 0) Diff();
+  }
+}
+
+void UpdateControllers(PPCContext& ctx, uint8_t* base, uint32_t self, bool check) {
+  const uint32_t frame = Load32(base, Load32(base, kRootSingleton) + 224);
+  if (frame == Load32(base, self + 56)) return;
+  const uint32_t old_sp = ctx.r1.u32, sp = old_sp - 160;
+  Store32(base, sp, old_sp);
+  ctx.r1.u64 = sp;
+  const uint32_t head = Load32(base, self + 8);
+  for (uint32_t n = Load32(base, head); n != head;) {
+    const uint32_t ctrl = Load32(base, n + 12);
+    if (base[ctrl + 52]) {
+      const uint32_t src = Load32(base, ctrl + 8), func = Load32(base, ctrl + 40), dest = Load32(base, ctrl + 24);
+      const uint32_t func_vt = Load32(base, func), dest_vt = Load32(base, dest);
+      const uint32_t get = Slot(base, src, 4);
+      double v;
+      if (get == 0x821C8BF8) {
+        v = double(LoadFloat(base, src + 8));
+      } else {
+        ctx.r3.u64 = src;
+        GuestFunc(base, get)(ctx, base);
+        v = ctx.f1.f64;
+      }
+      v = ControllerFunction(ctx, base, func, Load32(base, func_vt + 4), v, check);
+      ControllerDestination(ctx, base, dest, Load32(base, dest_vt + 8), v, check);
+    }
+    const uint32_t next = TreeNext<17>(base, n);
+    if (check) {
+      Store32(base, sp + 80, n);
+      ctx.r3.u64 = sp + 80;
+      __imp__sub_824C6960(ctx, base);
+      g_calls.fetch_add(1, std::memory_order_relaxed);
+      if (Load32(base, sp + 80) != next) Diff();
+    }
+    n = next;
+  }
+  Store32(base, self + 56, frame);
+  ctx.r1.u64 = old_sp;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821C8C00) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821C8C00(ctx, base);
+  UpdateControllers(ctx, base, ctx.r3.u32, mode == 2);
+  if (mode == 2) Report();
 }

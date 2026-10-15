@@ -5,7 +5,47 @@ Objectif : version PC (Linux, faite) puis Switch (publiée : torchlight-nx 1.0.0
 Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'exécutable, shaders générés en HLSL à
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
-## État et reprise (session du 2026-10-03, soir)
+## État et reprise (session du 2026-10-14, soir)
+- REPRENDRE ICI (2026-10-15, soir). Version 1.0.2 préparée, NON PUBLIÉE : dist/torchlight-nx-1.0.2.zip (MD5
+  f6f94267, .nro MD5 d6685a15, ELF switch/elf/torchlight-joueurs-1.0.2-20261015-2011.elf ; profil PGO de pgo/ du
+  2026-10-15 soir, aucune incompatibilité), texte de release dist/RELEASE-1.0.2.md (performances seulement, sans
+  chiffres, à la demande de l'utilisateur ; README sans chiffres d'images/s non plus). torchlight-nx : commit local
+  de synchronisation, push et release GitHub à faire par/à la demande de l'utilisateur. Zip 1.0.1 publié gardé :
+  dist/torchlight-nx-1.0.1-publie.zip (MD5 ff78834e).
+  Contenu depuis la 1.0.1 : appels indirects promus, constantes de .rdata, chargements flottants, -fno-math-errno,
+  registres locaux (feuilles, boucles), natives walkOctree / largeur des textes de CEGUI / contrôleurs, relevé
+  préchargé, -ffp-contract=off pour les natives. Dialogues vérifiés sur la console. Mesure du soir (build de test
+  équivalente, fréquences de base) : ville 272-277 dessins 20,2-20,9 ms (36-38 images/s) ; mine 198-199 dessins
+  15,6-15,9 ms (41-42) ; pas de référence 1.0.1 valable à 1600 MHz (celles du 2026-10-14 étaient à 2400).
+  Pistes restantes (< 1,2 % chacune) : addRenderable sub_821C3730, BillboardRenderer sub_821DA090,
+  getSquaredViewDepth sub_821C4DF8, recherche par nom sub_821C04C8.
+  Méthode de mesure : personnage immobile 1 min en ville puis dans la mine juste après l'arrivée, mêmes endroits,
+  et TOUJOURS vérifier la ligne « relojes » de rex_perfil.log des deux sessions (une session est passée à 2400 MHz
+  de mémoire sans que l'utilisateur le sache : profil sys-clk du jeu ?). Avant de supprimer le .nro de la console,
+  vérifier que le fichier de remplacement existe (le dossier temporaire peut disparaître).
+  Pipeline du code généré (build_switch.sh) : constantes_lecture_seule.py (si switch/out-pc/image_jeu.bin existe,
+  sinon refaire switch/tools/image_jeu.py), chargements_flottants.py, appels_indirects.py --promouvoir,
+  registres_locaux_feuilles.py --toutes, registres_locaux_boucles.py, appels_directs.py, pile_non_volatile.py ; tous idempotents. Après une régénération du code : nouveau relevé des appels indirects (PC,
+  torchlight_releve_appels_indirects), nouvelle liste, nouvelle image si besoin, nouveau profil PGO.
+  Zip publié 1.0.1 : dist/torchlight-nx-1.0.1.zip (MD5 ff78834e), à protéger avant tout build_joueurs.sh.
+- 2026-10-14 : appels indirects promus en appels directs gardés (switch/tools/appels_indirects.py, lancé par
+  build_switch.sh avant appels_directs.py ; liste switch/appels_indirects_promus.txt, 381 sites, 90 % des appels
+  indirects ; relevé et vérification PC : src/torchlight_appels_indirects.cpp) avec un nouveau profil PGO : -13 % en
+  ville, -15 % dans la mine sur la console (A/B contre la 1.0.1, journal). Essai prêt : dist/torchlight-essai-
+  indirects.nro (non publié, version encore 1.0.1). La liste vaut pour le code généré exact : après une
+  régénération, refaire le relevé (torchlight_releve_appels_indirects sur PC) puis la liste, puis le profil PGO.
+  Limites d'intégration du LTO : essai sans gain, abandonné (f929bb4). Lot 2 (même soir) : constantes de .rdata
+  repliées (switch/tools/constantes_lecture_seule.py, image du jeu par switch/tools/image_jeu.py), chargements
+  flottants dans l'unité vectorielle (switch/tools/chargements_flottants.py), -fno-math-errno : -4 à -6 % de plus aux
+  fréquences de base (ville ~20 ms, 37-38 images/s ; mine ~15 ms, 50 images/s). Essai : dist/torchlight-essai-lot2.nro
+  (non publié). Prochaine étape possible : une 1.0.2 (nouvelle session PGO si le code change encore).
+- 1.0.1 publiée le 2026-10-13 (torchlight-nx 9a52619, release v1.0.1 créée par l'utilisateur ; détail dans
+  « Problèmes ouverts et tâches »), vérifiée sur la console XJE1 sans torchlight.toml. Reste à confirmer : le
+  poisson de la pêche (bug intermittent selon l'utilisateur, retour attendu après une session longue). Journaux du
+  test : switch-logs-archive/20261013-v101/. Ancienne libvulkan.a (avant le correctif GPFIFO) gardée dans
+  ~/workspace/mesa-switch/nvk-sdk-sauvegarde-20261011/ (supprimable).
+- Pour tester sur PC avec la sauvegarde de la console : copie dans switch/out-pc/donnees-switch (0.tsv renommé
+  0.TSV) ; lancer natif_pc.sh avec DONNEES modifié ; manette de script : A vers 15 s suffit pour « Begin ».
 - Switch : jouable en rendu natif Vulkan, sauvegardes OK, clavier virtuel (swkbd), appuis fantômes corrigés.
   Performances aux fréquences de base (CPU 1020 / GPU 307,2 / mémoire 1600 MHz), test n°23 (LTO + PGO) : ville
   21,7-25 ms de rendu côté jeu (31-35 images/s sans profil, 29-30 avec), mine 17-19 ms (39-47 images/s) ; test
@@ -154,7 +194,7 @@ D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
 - switch/build_joueurs.sh : build LTO + PGO sans outils de développement (-DTORCHLIGHT_OUTILS=OFF : manette de script
   et capture d'écran ; TORCHLIGHT_NATIF reste) dans switch/out-joueurs, puis dist/torchlight-nx-<version>.zip
   (switch/torchlight/ : .nro, README.md, LICENSE, THIRD_PARTY_NOTICES.md). Version : TORCHLIGHT_VERSION dans
-  switch/CMakeLists.txt (1.0.1).
+  switch/CMakeLists.txt (1.0.2).
 - Lancement en mode applet (album) : message bloquant à l'écran (appletGetAppletType != Application) au lieu du
   simple avertissement du SDK.
 - Le .nro contient le code de default.xex recompilé (comme les .nro de nfsmw-nx) : zone grise assumée dans le README ;
@@ -185,7 +225,7 @@ matrices, bindGpuProgramParameters court, KeTlsGetValue (SDK), sommets des billb
 (nœuds, applyToNode, images clés, matrices des os), concatenateAffineMatrices, _updateAutoParams (10 types) ;
 relevé allégé (tables plates, pages vérifiées) ; lectures de pak.zip par cache de blocs de 64 Ko (64 Mo).
 Écarté : skip_lr / non_argument_as_local (section critique jamais relâchée), sauter des mises à jour d'images.
-Pistes restantes (ville, console, test n°23) : textures de rendu 207 (ombres, 5 dessins) et 208 (lumière, 40
+Fait aussi (2026-10-14) : appels indirects promus (-13/-15 %). Pistes restantes (ville, console, test n°23) : textures de rendu 207 (ombres, 5 dessins) et 208 (lumière, 40
 dessins) ~4 ms dont ~2/3 de recherche des objets visibles ; parcours de l'octree ~1,1 ms propre + 0,3 ms de
 visibilité des octants (réécriture native : ~0,5 ms, validation indirecte à prévoir) ; _updateRenderQueue des
 particules (~1 ms), de la géométrie statique (~0,8 ms) ; contrôleurs (particules, ~2 ms par image) ; accesseurs de
@@ -199,8 +239,8 @@ cœur (chantier lourd).
   « device lost » (GPFIFO de NVK, mesa-switch-gpfifo-reserve.patch), petites textures (côté <= 16 texels : poisson
   de la pêche), langue de la console (user_language ; une valeur fixée dans torchlight.toml, même 1, est respectée :
   test de la source du réglage), écran des succès, fond du menu dès le démarrage ; README mis à jour. Poisson à
-  revoir après une session plus longue (bug intermittent selon l'utilisateur). Publication (push, release GitHub)
-  à la demande de l'utilisateur.
+  revoir après une session plus longue (bug intermittent selon l'utilisateur). Poussé sur GitHub le 2026-10-13
+  (torchlight-nx 9a52619) ; release v1.0.1 créée par l'utilisateur.
 - Écran des succès du menu principal (2026-10-13, fait, vérifié sur la console : affichage, défilement, fermeture
   par B) : XamShowAchievementsUI (stub du SDK) ouvre une fenêtre ImGui (xam_ui.cpp, nfsmw-sdk.patch) avec la liste
   de l'AchievementManager (noms dans la langue de user_language), affichage bloquant comme la boîte de message ;

@@ -206,6 +206,14 @@ struct TextureCache {
   TextureRef ref;
 };
 std::unordered_map<uint32_t, TextureCache> g_texture_cache;
+// Petit cache à correspondance directe devant g_texture_cache (une recherche par unité et par dessin), par adresse
+// de la texture d'Ogre ; les nœuds de l'unordered_map ne bougent pas.
+struct TextureFront {
+  uint32_t tex = 0;
+  TextureCache* entry = nullptr;
+};
+TextureFront g_texture_front[256];
+inline TextureFront& TextureFrontSlot(uint32_t tex) { return g_texture_front[(tex >> 4) & 255]; }
 uint64_t g_frame = 0;
 // Écritures du jeu dans ses tampons de sommets et d'indices Direct3D : toutes passent par leur Lock (intercepté,
 // BufferLocked). Nombre de Lock par adresse physique : une copie faite depuis le dernier Lock est encore juste.
@@ -216,7 +224,9 @@ std::atomic<uint32_t> g_buffer_locks[kBufferLockSlots];
 inline uint32_t BufferLockSlot(uint32_t phys) { return (phys >> 8) * 0x9E3779B1u >> 16; }
 void ForgetOldGeometry();
 void FreeRetiredGeometry();
-std::atomic<uint64_t> g_geometry_reused{0}, g_geometry_copied{0};  // octets (relevé), pour le bilan
+// Octets de géométrie copiés et repris (relevé), pour le bilan : comptés dans l'image (thread du jeu, sans atomique),
+// cumulés par le thread de rendu.
+uint64_t g_geometry_reused = 0, g_geometry_copied = 0;
 
 Clock::time_point g_last_report;
 uint32_t g_frames_since_report = 0;
@@ -279,12 +289,14 @@ struct Frame {
   Arena arena;
   uint32_t width = 1280, height = 720;
   double game_ms = 0, read_ms = 0, tex_ms = 0, wait_ms = 0;  // thread du jeu
+  uint64_t geometry_reused = 0, geometry_copied = 0;          // octets (relevé)
   void Clear() {
     commands.clear();
     draws_used = 0;
     consts_used = 0;
     arena.Reset();
     game_ms = read_ms = tex_ms = wait_ms = 0;
+    geometry_reused = geometry_copied = 0;
   }
 };
 constexpr int kFrames = 3;
@@ -393,7 +405,8 @@ void Report() {
                      std::to_string(st.pipelines_created) + " pipelines créés (" +
                      std::to_string(int(st.ms_pipelines)) + " ms)";
   if (g_frames_since_report) {
-    const uint64_t copied = g_geometry_copied.exchange(0), reused = g_geometry_reused.exchange(0);
+    const uint64_t copied = g_geometry_copied, reused = g_geometry_reused;
+    g_geometry_copied = g_geometry_reused = 0;
     text += "\n  relevé de la géométrie, Ko par image : " + std::to_string(copied / g_frames_since_report / 1024) +
             " copiés, " + std::to_string(reused / g_frames_since_report / 1024) + " repris (tampons inchangés)";
   }
@@ -419,7 +432,9 @@ void Report() {
 // Texture d'Ogre -> fetch constant -> TextureRef (identité ; empreinte du contenu sur le thread de rendu,
 // détilage à la demande).
 const TextureRef* Texture(uint32_t tex, const uint8_t* base) {
-  TextureCache& c = g_texture_cache[tex];
+  TextureFront& front = TextureFrontSlot(tex);
+  if (front.tex != tex || !front.entry) front = {tex, &g_texture_cache[tex]};
+  TextureCache& c = *front.entry;
   if (c.frame == g_frame) return c.ok ? &c.ref : nullptr;
   c.frame = g_frame;
   if (!Ptr(tex, 0x130)) return (c.ok = false, nullptr);
@@ -768,6 +783,8 @@ void ProcessFrame(Frame& f) {
   g_cpu_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
   g_frame_ms += f.game_ms;
   g_draw_ms += f.read_ms;
+  g_geometry_copied += f.geometry_copied;
+  g_geometry_reused += f.geometry_reused;
   g_tex_ms += f.tex_ms;
   g_wait_ms += f.wait_ms;
   g_frames_since_report++;
@@ -1101,6 +1118,11 @@ class GeometryMap {
       if (s.key == key) return s.copy;
     }
   }
+  // Case où la recherche de `key` commencera (préchargée tôt dans Render : sur la console, la recherche attendait
+  // la mémoire).
+  void Prefetch(const GeometryKey& key) const {
+    if (!slots_.empty()) __builtin_prefetch(&slots_[Index(key)]);
+  }
   // Supprime les copies pour lesquelles drop(copie) est vrai (table reconstruite : appelé toutes les 64 images).
   template <class Drop>
   void EraseIf(Drop drop) {
@@ -1161,7 +1183,7 @@ const GeometryCopy& CopyRange(uint64_t id, const uint8_t* src, size_t first, siz
   GeometryCopy& c = g_geometry[{phys, uint32_t(first), uint32_t(bytes)}];
   c.last_used = g_frame;
   if (!c.bytes.empty() && c.locks == locks) {
-    g_geometry_reused += bytes;
+    g_cur->geometry_reused += bytes;
   } else {
     Retire(std::move(c.bytes));
     c.bytes.assign(src + first, src + first + bytes);
@@ -1182,7 +1204,7 @@ const GeometryCopy& CopyRange(uint64_t id, const uint8_t* src, size_t first, siz
     }
     c.locks = locks;
     c.max_index = max_index;
-    g_geometry_copied += bytes;
+    g_cur->geometry_copied += bytes;
   }
   return c;
 }
@@ -1230,9 +1252,33 @@ bool CopyGeometry(DrawDesc& d) {
 
 }  // namespace
 
+// Préchargements du relevé (console, profil du 2026-10-15 : le relevé attendait surtout la mémoire, sans boucle
+// chaude) : descripteur du dessin suivant et ses tableaux (~300 descripteurs de 920 octets par image, 3 images en
+// circulation : froids quand on les réutilise), cases des compteurs de Lock et de la table des géométries dès que
+// l'adresse d'un tampon est connue. Aucun effet sur ce qui est relevé.
+static void PrefetchNextDraw(const Frame& f) {
+  if (f.draws_used + 1 >= f.draws.size()) return;
+  const DrawDesc& n = f.draws[f.draws_used + 1];
+  const char* p = reinterpret_cast<const char*>(&n);
+  for (size_t off = 0; off < 256; off += 64) __builtin_prefetch(p + off, 1);  // champs avant matrix et stage
+  if (!n.elems.empty()) __builtin_prefetch(n.elems.data(), 1);
+  if (!n.streams.empty()) __builtin_prefetch(n.streams.data(), 1);
+  if (!n.textures.empty()) __builtin_prefetch(n.textures.data(), 1);
+}
+
+static void PrefetchBuffer(uint32_t addr) {
+  __builtin_prefetch(&g_buffer_locks[BufferLockSlot(torchlight::invite::ToPhysical(addr & ~3u))]);
+}
+
 void Render(uint32_t op, const uint8_t* base) {
   if (!Active() || !Ptr(op, 0x18)) return;
   Frame& f = *g_cur;
+  PrefetchNextDraw(f);
+  for (uint32_t u = 0; u < kMaxUnits; u++) {
+    if (!g_state.tex_enabled[u]) continue;
+    const TextureFront& t = TextureFrontSlot(g_state.textures[u]);
+    if (t.tex == g_state.textures[u] && t.entry) __builtin_prefetch(t.entry);
+  }
   struct Timer {
     Frame& f;
     uint64_t t0 = FastTicks();
@@ -1290,6 +1336,9 @@ void Render(uint32_t op, const uint8_t* base) {
         return;
       }
       const uint32_t addr = Load32(base, d3d + 0x18) & ~3u;  // mot 0 : type en bits 0-1
+      PrefetchBuffer(addr);
+      if (!d.indexed)
+        g_geometry.Prefetch({torchlight::invite::ToPhysical(addr), d.vstart * stride, d.vcount * stride});
       d.streams.push_back({source, Physical(addr), size, stride, uint64_t(addr) << 32 | size});
     });
   }
@@ -1304,6 +1353,9 @@ void Render(uint32_t op, const uint8_t* base) {
     const uint32_t d3d = Ptr(res, 4) ? Load32(base, res) : 0;
     if (!Ptr(d3d, 0x20)) return;
     const uint32_t addr = Load32(base, d3d + 0x18);
+    PrefetchBuffer(addr);
+    const uint32_t ibytes = isize == 2 ? 2 : 4;
+    g_geometry.Prefetch({torchlight::invite::ToPhysical(addr & ~3u), d.istart * ibytes, d.icount * ibytes});
     d.index = {Physical(addr), size, isize, uint64_t(addr) << 32 | size};
   }
 

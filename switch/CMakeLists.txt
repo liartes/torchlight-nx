@@ -14,7 +14,7 @@ project(torchlight LANGUAGES CXX)
 
 # Nom public du projet : torchlight-nx (portage non officiel ; menu homebrew, zip des joueurs). Version affichée par
 # le menu homebrew et nom du zip (switch/build_joueurs.sh).
-set(TORCHLIGHT_VERSION "1.0.1")
+set(TORCHLIGHT_VERSION "1.0.2")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +34,7 @@ include(generated/rexglue.cmake)
 
 add_executable(torchlight ../src/main.cpp ../src/torchlight_trace.cpp ../src/torchlight_manette.cpp
     ../src/torchlight_capture.cpp ../src/torchlight_natif.cpp ../src/torchlight_crt.cpp ../src/torchlight_ogre_natif.cpp ../src/torchlight_pgo.cpp ../src/natif/rendu.cpp
-    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp
+    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp
     ${REXSDK_DIR}/thirdparty/glslang/StandAlone/ResourceLimits.cpp)
 target_include_directories(torchlight PRIVATE ../src)
 # Rendu natif : empreintes des textures avec XXH3 (rex/hash.h), en-tête du SDK non exporté par ses cibles.
@@ -79,6 +79,25 @@ if(TORCHLIGHT_PILE_NON_VOLATILE AND TARGET torchlight_recomp)
 endif()
 
 if(REXGLUE_PLATFORM_SWITCH)
+    # -fno-math-errno sur le code du jeu (comme sa2-nx) : sans lui, chaque racine carrée (fsqrt) est suivie d'un test
+    # et d'un appel de secours à sqrt() pour renseigner errno, que le code recompilé ne lit jamais (résultats
+    # identiques). Mesuré (2026-10-14) : -0,3 % d'instructions dans un fichier à 12 racines carrées, 2 instructions
+    # de moins par racine carrée exécutée. L'en-tête précompilé prend les options de la cible : l'option doit être
+    # celle de la cible entière (sinon il garde -fmath-errno et l'impose). Aussi sur notre code (interceptions natives
+    # appelées par le jeu) : avec le LTO, GCC n'intègre pas l'une dans l'autre deux fonctions qui diffèrent sur
+    # -fmath-errno (piège relevé par sa2-nx). Notre code ne lit pas errno après une fonction mathématique.
+    # Fonctions natives d'Ogre (validées au bit près sur PC, sans fma) : GCC contracte par défaut a * b + c en fma
+    # (-ffp-contract=fast en mode GNU), ce qui changerait les arrondis sur la console ; les fma du jeu (fmadds)
+    # y sont écrites explicitement (std::fma).
+    set_source_files_properties(../src/torchlight_ogre_natif.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+    option(TORCHLIGHT_SANS_MATH_ERRNO "-fno-math-errno sur le code du jeu et le nôtre" ON)
+    if(TORCHLIGHT_SANS_MATH_ERRNO)
+        foreach(cible torchlight_recomp torchlight)
+            if(TARGET ${cible})
+                target_compile_options(${cible} PRIVATE -fno-math-errno)
+            endif()
+        endforeach()
+    endif()
     # LTO sur le code du jeu et le nôtre (pas sur les bibliothèques du SDK), comme nfsmw-nx : avec les appels directs
     # (switch/tools/appels_directs.py), le compilateur peut intégrer des fonctions du jeu d'un fichier à l'autre.
     # Premier essai (un seul processus) : pic à 7,2 Go sur 15, phase LTRANS de ~300 Mo par partition ; 4 processus.
@@ -122,6 +141,28 @@ if(REXGLUE_PLATFORM_SWITCH)
                 target_compile_options(${cible} PRIVATE ${TORCHLIGHT_PGO_OPTIONS})
             endif()
         endforeach()
+    endif()
+    # Limites de l'intégration (inlining) pour le code du jeu, avec le LTO et un profil (comme sa2-nx 1.0.1,
+    # docs/cpu-rounds.md « Link-time optimisation of a recompiled program ») : aucune fonction recompilée n'est
+    # déclarée inline, donc la limite de GCC pour les autres (max-inline-insns-auto = 30) refuse la plupart des
+    # appels chauds. Avec le profil, l'intégrateur ne fait grossir que les appels exécutés ; inline-unit-growth
+    # plafonne la croissance du code (40 % chez GCC). Le profil reste valable : ses compteurs sont posés avant
+    # l'intégration interprocédurale. Options de compilation (GCC garde ses paramètres par fonction et l'intégrateur
+    # prend ceux de l'appelant). Vide : valeur du compilateur.
+    # Essai du 2026-10-13 (64 / 12, switch/RENDU_NATIF.md) : code +5 %, aucun gain mesuré sur la console (ville plus
+    # lente de 8-10 % à nombre de dessins égal) : abandonné, vide par défaut.
+    set(TORCHLIGHT_INLINE_AUTO "" CACHE STRING
+        "max-inline-insns-auto du code du jeu avec LTO et profil (vide : valeur du compilateur)")
+    set(TORCHLIGHT_INLINE_UNIT_GROWTH "" CACHE STRING
+        "inline-unit-growth du code du jeu avec LTO et profil (vide : valeur du compilateur)")
+    if(TORCHLIGHT_LTO AND TORCHLIGHT_PGO STREQUAL "utiliser" AND TARGET torchlight_recomp)
+        if(TORCHLIGHT_INLINE_AUTO)
+            target_compile_options(torchlight_recomp PRIVATE --param=max-inline-insns-auto=${TORCHLIGHT_INLINE_AUTO})
+        endif()
+        if(TORCHLIGHT_INLINE_UNIT_GROWTH)
+            target_compile_options(torchlight_recomp PRIVATE
+                --param=inline-unit-growth=${TORCHLIGHT_INLINE_UNIT_GROWTH})
+        endif()
     endif()
     # Fonctions chaudes regroupées au début de .text (switch/tools/ordre_fonctions.py, d'après les profils des
     # piles de la console ; méthode de nfsmw-nx). Le fichier garde KEEP (*(.crt0)) en tête.

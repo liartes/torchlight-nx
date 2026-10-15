@@ -926,3 +926,148 @@ l'émulation GPU.
 - 2026-10-13 : écran des succès et fond du menu **vérifiés sur la console** (XJE1) : liste affichée, défilement et
   fermeture par B ; menu_dernier_personnage.txt = SAVE:\2.TSV, puis au démarrage suivant « fond du démarrage
   d'après SAVE:\2.TSV : trouvé », « Continuer » monte ensuite la vraie sauvegarde normalement.
+- 2026-10-13 : **essai des limites d'intégration du LTO** (idée de sa2-nx 1.0.1, docs/cpu-rounds.md de ce projet) :
+  --param=max-inline-insns-auto=64 et inline-unit-growth=12 sur torchlight_recomp, avec LTO et profil
+  (TORCHLIGHT_INLINE_AUTO, TORCHLIGHT_INLINE_UNIT_GROWTH dans switch/CMakeLists.txt ; vides = valeurs de GCC). Même
+  profil PGO. ELF : .text 59,26 -> 62,24 Mo (+5 %), .nro 76,6 -> 79,6 Mo, bl 651 017 -> 657 237 (compte statique,
+  sans valeur pour le gain). Essai : dist/torchlight-essai-inline64.nro (MD5 3f9dd0c6), ELF
+  switch/elf/torchlight-essai-inline64-20261013.elf. À mesurer sur la console contre la 1.0.1, même console, mêmes
+  fréquences, même endroit. Autres pistes de sa2-nx retenues pour plus tard : appels indirects promus (17 220 bctrl),
+  -fomit-frame-pointer (55 725 cadres ; casserait la pile de rex_crash.log et du profileur), -fno-math-errno.
+- 2026-10-14 : **essai des limites d'intégration abandonné.** Console XJE1, CPU 1020 / GPU 307,2 / mémoire 2400
+  pendant le jeu dans les deux sessions (le profileur lit 1600 au menu puis 2400 en jeu : profil de sys-clk ?).
+  Temps « image » : ville, essai 20,5-21,6 ms (243-284 dessins) contre 1.0.1 18,8-19,4 ms (269-277) ; mine, essai
+  16,9-18,3 ms (263-279) contre 14,7-16,9 ms (222-228), non comparable. Aucun gain, plutôt une perte en ville
+  (code +5 % : cache d'instructions ?). Options gardées, vides par défaut. Journaux :
+  switch-logs-archive/20261014-essai-inline64/ et 20261014-reference-101/.
+- 2026-10-14 : **appels indirects promus en appels directs gardés** (idée et outils de sa2-nx, GPL-3.0, adaptés) :
+  switch/tools/appels_indirects.py (marquage des 17 220 sites bctrl, promotion d'après une liste ; lancé par
+  build_switch.sh AVANT appels_directs.py), src/torchlight_appels_indirects.cpp (PC : relevé par site, option
+  torchlight_releve_appels_indirects=<fichier> ; vérification de chaque appel promu contre la table de
+  répartition), switch/tools/appels_indirects_promus.py (liste switch/appels_indirects_promus.txt).
+  Relevé PC (deux parties de 2 min dans les mines, sauvegardes console et PC) : ~4 millions d'appels indirects par
+  seconde (~70 000 par image, trois fois SA2), 4 760 sites, 94,8 % vers la cible la plus fréquente du site.
+  381 sites promus (26 à deux ou trois cibles) prennent 90,2 % des appels ; les plus chauds : petites fonctions
+  d'Ogre (sub_821C4798 -> sub_821C47F0 : 4 % de tous les appels). PC : 391 millions d'appels promus vérifiés,
+  0 différence. Le code de 122 fichiers change : nouveau profil PGO nécessaire (build instrumentée switch/out-pgo
+  avec -DTORCHLIGHT_OUTILS=OFF, comme la build des joueurs).
+- 2026-10-14 : **appels indirects promus, mesurés sur la console : -13 % en ville, -15 % dans la mine.** Nouveau
+  profil PGO (session de 24 min, 7 vidages, pgo/ ; build instrumentée -DTORCHLIGHT_OUTILS=OFF), build des joueurs
+  sans avertissement d'incompatibilité du profil (dist/torchlight-essai-indirects.nro, MD5 77b7262b, ELF
+  switch/elf/torchlight-essai-indirects-20261014-0945.elf ; .text 59,26 Mo comme la 1.0.1). A/B sur XJE1, CPU
+  1020 / GPU 307,2 / mémoire 2400 (profileur, les deux sessions), personnage immobile aux mêmes endroits :
+  ville 277-281 dessins, 1.0.1 19,4 ms (39 images/s) contre 16,9 ms (44-45) ; mine 151-155 dessins, 1.0.1
+  12,7-13,2 ms (50-51 images/s) contre 10,8 ms (59, plafond de 60). Thread de rendu inchangé (8,7-9 / 5,5 ms).
+  Journaux : switch-logs-archive/20261014-essai-indirects/, 20261014-reference-101-immobile/, 20261014-session-pgo/.
+  Piège de manipulation : ne jamais supprimer le .nro de la console avant d'avoir vérifié le fichier de
+  remplacement (le dossier temporaire du zip extrait avait disparu entre deux tours).
+- 2026-10-14 : **-fno-math-errno** (code du jeu et le nôtre, TORCHLIGHT_SANS_MATH_ERRNO) : 2 instructions de moins
+  par racine carrée exécutée, -0,3 % d'instructions dans un fichier à 12 racines carrées. Piège : l'en-tête
+  précompilé du code généré impose ses options ; mesuré sans .gch. Option aussi sur notre code : avec le LTO, GCC
+  n'intègre pas entre fonctions qui diffèrent sur -fmath-errno. **-fomit-frame-pointer** mesuré (-0,85 à -1 %
+  d'instructions sur trois fichiers) mais non appliqué : casserait la chaîne x29 du profileur et du rapport de
+  plantage.
+- 2026-10-14 : **constantes de .rdata repliées** (switch/tools/constantes_lecture_seule.py, d'après ro_constants.py
+  de sa2-nx ; image : switch/tools/image_jeu.py -> switch/out-pc/image_jeu.bin, jamais versionnée ; lancé par
+  build_switch.sh avant les appels indirects, sauté si l'image manque). 5 757 chargements flottants, 907 doubles,
+  302 entiers (adresse construite par lis/addi/ori sur une ligne droite, dans .rdata 82000400-82148BC0 ; vectoriels
+  non traités). PC : 94 millions de chargements vérifiés contre la mémoire en 2 min, 0 différence. Switch (fichier
+  100, 28 replis) : -1,2 % d'instructions, -3,7 % de chargements. Code de 218 fichiers changé : nouveau profil PGO
+  à faire avant de mesurer sur la console (à regrouper avec les étapes suivantes).
+- 2026-10-14 : **chargements flottants (lfs) inversés dans l'unité vectorielle** (switch/tools/chargements_flottants.py,
+  d'après float_loads.py de sa2-nx ; build_switch.sh, après les constantes) : ldr s + rev32 au lieu de ldr w + rev +
+  fmov s, w (le transfert entier -> flottant coûte 5 cycles sur l'A57). 22 465 sites ; 4 414 copies (valeur aussitôt
+  réécrite par un stfs) gardées en forme entière (sinon un fmov w, s de plus). Pièges : vset_lane_f32 sur un vecteur
+  nul ajoutait un fmov s, s -> assembleur en ligne ; contrainte "Q" -> addition d'adresse en plus, "m" garde le
+  décalage. Lecture volatile gardée (asm volatile), comme REX_LOAD_U32. Fichier 100 : 66 sites, -21 instructions,
+  14 fmov s, w au lieu de 81. PC : forme entière (inchangé). Auto-contrôle au démarrage sur la Switch
+  (« [auto-contrôle] chargements flottants », src/torchlight_appels_indirects.cpp) : forme ARM contre forme entière
+  sur 16 valeurs (zéros, infinis, NaN, dénormaux).
+- 2026-10-14 (soir) : **lot 2 mesuré sur la console** (constantes de .rdata, chargements flottants, -fno-math-errno,
+  avec les appels promus ; nouveau profil PGO, session de 32 min ; dist/torchlight-essai-lot2.nro, MD5 61f32799, ELF
+  switch/elf/torchlight-essai-lot2-20261014-2156.elf). Auto-contrôle des chargements flottants passé sur la console.
+  A/B aux fréquences de base (CPU 1020 / GPU 307,2 / mémoire 1600, profileur, les deux sessions), mêmes endroits,
+  contre l'essai des appels promus seuls : ville 269-273 dessins 21,3-21,8 ms (32-35 images/s) contre 262-266 dessins
+  19,7-20,2 ms (37-38) ; mine 187-188 dessins 15,6-16,0 ms (46-48) contre 183-184 dessins 14,9-15,1 ms (50).
+  Gain d'environ 4-6 % (un peu moins de dessins dans la session du lot 2 : 2-3 %). Attention : une première session
+  du lot 2 tournait avec la mémoire à 2400 MHz (11,4 ms dans la mine contre 15,7 ms à 1600 au même endroit) :
+  toujours vérifier la ligne « relojes » des deux sessions avant de comparer. Journaux :
+  switch-logs-archive/20261014-essai-lot2-1600/ et 20261014-reference-indirects-soir/.
+- 2026-10-15 : **registres en variables locales dans les fonctions feuilles** (switch/tools/registres_locaux_feuilles.py
+  --toutes, d'après leaf_locals.py de sa2-nx ; build_switch.sh, avant appels_directs.py). Chez nous, les accès
+  volatile à la mémoire du jeu empêchent le compilateur de garder en registres de l'hôte les registres restés dans ctx
+  (aliasing) ; une fonction sans aucun appel peut les garder en variables locales. 5 026 feuilles, 29 854 registres
+  (5 714 seulement lus). Switch, quatre fichiers : -0,9 à -1,9 % d'instructions, -4,6 à -7,7 % de chargements, -2 à
+  -6 % d'écritures ; la variante « feuilles avec boucle seulement » (1 172) fait moins bien partout. PC : partie
+  normale, vérifications à 0 différence. Exact par construction (rien d'autre ne lit ctx pendant une feuille).
+- 2026-10-15 : **registres en variables locales le temps des boucles sans appel** (switch/tools/registres_locaux_boucles.py,
+  d'après loop_locals.py de sa2-nx ; début de boucle = étiquette visée par un saut en arrière, faute de barrières
+  chez nous ; std::isnan ajouté aux noms connus, boucles avec __sync_bool_compare_and_swap laissées). 8 522 régions
+  dans 3 379 fonctions, 43 170 registres, 6 471 passerelles. Switch, quatre fichiers : -1,1 à -1,9 % de chargements,
+  -1,3 à -2,4 % d'écritures, instructions -0,6 à +0,9 % (passerelles hors des boucles). PC : partie normale,
+  vérifications à 0 différence.
+- 2026-10-15 : **divisions (sdiv/udiv) et conversions (fcvtzs) en assembleur : essayé, abandonné.** Résultats exacts
+  (simde fait déjà une conversion C saturante sur ARM) mais gain statique de -1,7 à +0,7 % selon le fichier :
+  l'assembleur empêche le compilateur de fusionner ou supprimer des conversions (215 : fcvtzs 37 -> 63) ; opérations
+  rares dans le code chaud. Outil non gardé.
+- 2026-10-15 : **profil de la console avec le lot 2** (dist/torchlight-essai-lot2.nro, pilas-on, ~6 min aux fréquences
+  de base ; pilas-archive/rex_pilas-20261015-lot2.txt, switch-logs-archive/20261015-profil-lot2/). Avec cette build
+  LTO, le thread principal se trouve par son nom (`pilas.py ... "Main XThread (F"`), pas par sub_821F8818. Profil
+  toujours plat ; en jeu (ville et mine), temps propre : walkOctree sub_821C7158 4-7 %, natif::Render (notre relevé)
+  ~3 % (+2 % dans ses appels), natives du squelette ~3 %, renderSingleObject sub_821C5FA0 2-3 %, memcpy ~2,4 %,
+  contrôleurs sub_821C8C00 ~1,6 % (7,6 % inclusif avec les particules), setPass sub_821C5730 ~2 %.
+  **Scène lente de la ville (18 images/s, ~52 ms, 177 dessins ; 14:46:19-14:47:19, PNJ donneur de quête)** : ~40 %
+  du thread principal dans le texte de CEGUI (sub_821B3DA0, largeur d'un texte : Font::getTextExtent de la variante
+  du jeu, boucle sur les caractères avec recherche des glyphes ; appelée par sub_825B37F8 et sub_825B3420, mise en
+  page du texte avec retour à la ligne), 5,8 % du thread sur toute la session en temps propre.
+- 2026-10-15 : **parcours de l'octree en natif** (src/torchlight_ogre_natif.cpp : sub_821C7158 walkOctree, avec
+  sub_821C7000 _getCullBounds et sub_821C0E78 getVisibility, aussi interceptées). Même pile explicite en mémoire du
+  jeu, même r18 gardé dans les octants complets, mêmes appels virtuels (isVisible, _notifyCurrentCamera,
+  _updateRenderQueue ; cibles courantes appelées directement), préchargements aux endroits des dcbt du jeu.
+  Validation (mode 2) : parcours à blanc (sans _notifyCurrentCamera ni _updateRenderQueue) avant l'original,
+  comparé aux visibilités d'octants et tests de boîtes relevés pendant l'original (appels faits depuis le cadre du
+  parcours) et au contenu de la pile : PC, deux zones (191 et 287 dessins), 42 000 parcours, 34 millions de mots
+  comparés, 0 différence ; _getCullBounds et getVisibility aussi comparées à chaque appel. perf sur PC : parcours
+  1,10 % -> 0,75 % des échantillons. Les appels de sub_821C7000 et sub_821C0E78 remis en sub_X dans le code généré
+  (fichiers 17, 101, 107, 146, 190). Aussi : -ffp-contract=off pour torchlight_ogre_natif.cpp sur la Switch (GCC
+  contracte a * b + c en fma par défaut en mode GNU : les natives validées sur PC, sans fma, auraient pu s'écarter du
+  recompilé sur la console). À mesurer sur la console avec les natives suivantes.
+- 2026-10-15 : **largeur des textes de CEGUI en natif** (sub_821B3DA0 getTextExtent et sub_821B3C88 getGlyphData,
+  src/torchlight_ogre_natif.cpp). L'original convertit à chaque appel le texte et deux balises de la police en
+  UTF-8 puis en std::wstring (allocations, ConvertUTF8toUTF16 d'Unicode Inc. dans sub_821B3780) ; pour des points
+  de code de 1 à 0xFFFF l'aller-retour est l'identité, la native lit donc les points de code de la CEGUI::String
+  (sinon l'original). Balises (police +1028, find_first_of sub_821A5CE0, wcsncmp sub_821B39E0) et arrondis
+  (fadds, fmuls avec l'échelle en double, fmadds) comme le jeu ; pages de glyphes chargées à la demande comme
+  l'original (bit en +720, rasterize [3] du jeu). Non reproduits : allocations temporaires et tampon UTF-8 des
+  chaînes (cache refait par chaque c_str). Validation sur PC (mode 2, mine, interface) : 140 000 largeurs dont
+  44 000 avec balises, 0 différence (résultat comparé au bit près) ; getGlyphData comparée à chaque appel. Appels
+  remis en sub_X dans 21 fichiers du code généré. La scène du PNJ n'a pas pu être rejouée sur PC : à regarder sur la
+  console (mise en page des dialogues).
+- 2026-10-15 : **contrôleurs en natif** (sub_821C8C00 updateAllControllers) : boucle sur le std::set, source
+  FrameTimeControllerValue, fonctions getAdjustedInput (avec ou sans échelle) et modificateur de coordonnées de
+  texture en natif ; ParticleSystemUpdateValue et les cibles inconnues restent celles du jeu. Validation (mode 2) :
+  chaque calcul natif comparé à la fonction du jeu sur le même état (sauvegardé puis remis), successeur de l'arbre
+  comparé à sub_824C6960 : ~2 millions de comparaisons par 10 s, 0 différence (deux zones). TreeNext généralisé
+  (isnil en +21 pour les std::map, +17 pour ce std::set). Appel remis en sub_X (fichier 214). Rendu vérifié sur PC
+  en mode 1 (mine, capture).
+- 2026-10-15 : **relevé (natif::Render) : attentes de la mémoire.** Profil de la console : ~2,9 % du thread
+  principal en propre (4,3 % avec ses appels) sans boucle chaude ; points chauds = premières lectures du
+  descripteur de dessin (920 octets, ~300 par image, 3 images en circulation), case de la table des géométries,
+  compteur de Lock (ldar dans une table de 256 Ko), recherche des textures (unordered_map). Constantes mesurées sur
+  PC : 138 Ko par image, toutes lues par le rendu (rien à gagner à en copier moins). Fait : préchargement du
+  descripteur suivant et de ses tableaux, des cases du compteur de Lock et de la table des géométries dès que
+  l'adresse d'un tampon est connue ; petit cache direct devant le cache des textures (préchargé en début de
+  dessin) ; compteurs de géométrie du bilan dans l'image au lieu d'atomiques (~700 par image). Aucun changement de
+  ce qui est relevé (PC : mêmes dessins, capture juste). perf sur PC : relevé ~1,6 % du thread du jeu, peu
+  parlant (gros caches) : à mesurer sur la console.
+- 2026-10-15 (soir) : **session PGO** avec la build instrumentée (lot 3, natives de l'octree, du texte et des
+  contrôleurs, relevé préchargé ; dist/torchlight-pgo-instrumente.nro, MD5 d121a6af) : 22 min aux fréquences de base,
+  237 profils (pgo/), journaux switch-logs-archive/20261015-pgo-session/. Dialogues des PNJ affichés correctement
+  (native du texte vérifiée sur la console par l'utilisateur). Build finale LTO + PGO lancée (switch/out-lto).
+- 2026-10-15 (soir) : **version 1.0.2 préparée** (build des joueurs, LTO + PGO du soir, aucune incompatibilité du
+  profil) : dist/torchlight-nx-1.0.2.zip (MD5 f6f94267, .nro d6685a15), texte dist/RELEASE-1.0.2.md. Mesure de la
+  build de test équivalente (aux fréquences de base) : ville 272-277 dessins 20,2-20,9 ms (36-38 images/s), mine
+  198-199 dessins 15,6-15,9 ms (41-42, niveau plus chargé que pour le lot 2) ; journaux
+  switch-logs-archive/20261015-essai-natives/. Aucune référence 1.0.1 valable aux fréquences de base (les sessions
+  du 2026-10-14 tournaient à 2400 MHz de mémoire) : pas de chiffre publié. README : chiffres d'images/s retirés
+  (variables selon les lieux et les réglages), sa2-nx dans les remerciements.

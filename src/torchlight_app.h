@@ -21,6 +21,9 @@
 // (option TORCHLIGHT_OUTILS=OFF).
 #if defined(TORCHLIGHT_NATIF)
 #include "torchlight_natif.h"
+namespace torchlight::appels_indirects {
+void Initialiser();  // src/torchlight_appels_indirects.cpp
+}
 #endif
 #if defined(TORCHLIGHT_OUTILS)
 #include <rex/ui/presenter.h>
@@ -233,6 +236,7 @@ class TorchlightApp : public rex::ReXApp {
   // Rendu natif (torchlight_natif) : périphérique Vulkan et presenter du SDK.
   // Outils : capture d'écran de l'émulation pour la comparer au rendu natif (torchlight_capture_s), en PPM.
   void OnPostSetup() override {
+    torchlight::appels_indirects::Initialiser();  // relevé et vérification des appels indirects (PC)
     if (const auto* gs = runtime() ? runtime()->graphics_system() : nullptr)
       torchlight::natif::SetPresentation(gs->provider(), gs->presenter());
     if (const auto* rt = runtime()) torchlight::natif::SetPaths(rt->game_data_root(), rt->user_data_root());

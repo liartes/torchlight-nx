@@ -10,6 +10,7 @@ repository derived from it. The rest of this repository is under the GPL-3.0 (`L
 | [NFSMW-NX](https://github.com/StevensND/nfsmw-nx) by StevensND (commit `66611e3`), itself derived from [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The Switch port this one follows: the modified SDK with its Horizon layer, the build and toolchain setup, the native renderer approach, and the methods behind `src/torchlight_crt.cpp`, `src/torchlight_pgo.cpp`, `src/torchlight_manette.cpp`, `src/torchlight_ogre_natif.cpp` and `switch/tools/` | GPL-3.0 |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | Code generator, Xbox 360 kernel and runtime (linked into the NRO and the PC build) | BSD-3-Clause |
 | [mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico, on top of [Mesa](https://mesa3d.org) | The Vulkan driver (NVK) and shader compiler (NAK) for Horizon, linked into the NRO | MIT (Mesa's licenses per file) |
+| [sa2-nx](https://github.com/ChanseyIsTheBest/sa2-nx) by ChanseyIsTheBest | The method and tools behind `switch/tools/appels_indirects.py`, `switch/tools/appels_indirects_promus.py`, `switch/tools/constantes_lecture_seule.py`, `switch/tools/chargements_flottants.py`, `switch/tools/registres_locaux_feuilles.py`, `switch/tools/registres_locaux_boucles.py` and `src/torchlight_appels_indirects.cpp` (indirect calls that usually go to one function turned into guarded direct calls; constants of the game's read-only data folded at build time; single-precision loads byte-swapped in the vector unit; registers as locals in leaf functions and in call-free loops) | GPL-3.0 |
 | [OGRE](https://www.ogre3d.org) 1.7 (Torus Knot Software and the OGRE contributors) | The native renderer replays the calls of the game's Ogre render system; `src/torchlight_ogre_natif.cpp` rewrites a few Ogre functions (frustum, matrices, animation, automatic shader parameters) with the same results | MIT |
 
 ### Changes to these projects
@@ -21,7 +22,7 @@ is under the license of the project it changes, so it can be reused there:
 |---|---|---|
 | `nfsmw-sdk.patch` | `sdk/` of NFSMW-NX (the ReXGlue SDK with its Horizon layer): file reads, input, save data, virtual keyboard, presentation | BSD-3-Clause |
 | `glslang-verrou.patch` | glslang (`sdk/thirdparty/glslang`) | BSD-3-Clause |
-| `mesa-switch-build.patch`, `mesa-switch-zcull-toggle.patch` | mesa-switch, branch built from `1a8c1a66d6f` | MIT |
+| `mesa-switch-build.patch`, `mesa-switch-zcull-toggle.patch`, `mesa-switch-gpfifo-reserve.patch` | mesa-switch, branch built from `1a8c1a66d6f` | MIT |
 
 ## Libraries
 

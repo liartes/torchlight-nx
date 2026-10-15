@@ -9,8 +9,8 @@
 
 It's not an emulator. The PowerPC code of the game's `default.xex` is statically recompiled to C++ with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled for the Switch, and the game is drawn by a native
-Vulkan renderer running on NVK (Mesa). It runs at the console's **stock clocks**, with no overclock needed: around
-30-35 FPS in town and 40-47 FPS in the mines.
+Vulkan renderer running on NVK (Mesa). It runs at the console's **stock clocks**, with no overclock needed (the frame rate depends on the
+area and on the console's settings).
 
 > [!NOTE]
 > You need your own copy of Torchlight for Xbox Live Arcade: the game package from your Xbox 360.
@@ -120,6 +120,10 @@ cd switch && ~/workspace/nfsmw-nx/sdk/out/linux-amd64/rexglue codegen torchlight
 JOBS=4 switch/build_switch.sh                # switch/out/torchlight.nro
 ```
 
+`build_switch.sh` also folds the game's read-only constants into the code when `switch/out-pc/image_jeu.bin` exists
+(a copy of the loaded game image made by `switch/tools/image_jeu.py` from the PC build; never distributed); without
+it, that step is skipped.
+
 The repository expects NFSMW-NX and mesa-switch next to it (`~/workspace/nfsmw-nx`, `~/workspace/mesa-switch`).
 The release build (`switch/build_joueurs.sh`: LTO, profile-guided optimization, no developer tools) also needs PGO
 profiles from a play session (`pgo/`, see `CMakeLists.txt`); without them, use `build_switch.sh` with
@@ -144,6 +148,9 @@ This port would not exist without the work of these projects and their developer
   the NVK Vulkan driver running on the Switch.
 - [OGRE](https://github.com/OGRECave/ogre): the engine Torchlight runs on, whose rendering calls the native
   renderer replays.
+- [sa2-nx](https://github.com/ChanseyIsTheBest/sa2-nx) by ChanseyIsTheBest: the build-time rewrites of the
+  recompiled code that make the game run faster (indirect calls, read-only constants, floating-point loads,
+  registers kept in locals).
 
 **Switch homebrew**
 
