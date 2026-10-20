@@ -33,6 +33,13 @@ nfsmw_io_rangos_mb = 0
 # Fond du menu principal d'après le dernier personnage joué, dès le démarrage (src/torchlight_menu_fond.cpp).
 # torchlight_menu_fond = false
 
+# Blocs de géométrie statique hors de l'écran non mis en file (src/torchlight_blocs.cpp) : 0 = comme le jeu,
+# 1 = retirés (défaut), 2 = validation (rien de retiré, liste dans la capture). Images identiques.
+# torchlight_blocs = 0
+
+# SetStreamSource et SetIndices du Direct3D du jeu sautés en rendu natif seul (vrai par défaut).
+# torchlight_natif_liaisons = false
+
 [log.levels]
 # Le jeu essaie plusieurs chemins pour chaque fichier (game:\music\..., game:\programs\...) :
 # des milliers d'avertissements NtCreateFile bénins, chacun écrit sur la SD en plusieurs ms.

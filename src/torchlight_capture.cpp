@@ -31,6 +31,10 @@ REXCVAR_DEFINE_DOUBLE(torchlight_capture_s, 0.0, "Torchlight",
                       "Capturer l'image qui commence après ce nombre de secondes dans trace/capture/ (0 = jamais)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+namespace torchlight::blocs {
+bool Marked(uint32_t vertex_data);
+}
+
 namespace torchlight::capture {
 namespace {
 
@@ -48,6 +52,7 @@ std::filesystem::path g_dir;
 enum class Phase { kWaiting, kRecording, kDone } g_phase = Phase::kWaiting;
 FILE* g_frame = nullptr;
 int g_draw = 0;
+std::vector<int> g_retires;  // dessins que le tri des blocs aurait retirés (validation)
 std::unordered_set<std::string> g_written;
 std::function<void(const std::filesystem::path&)> g_screenshot;
 
@@ -327,6 +332,11 @@ void EndGameFrame() {
   if (g_phase != Phase::kRecording) return;
   std::fprintf(g_frame, "end %d\n", g_draw);
   std::fclose(g_frame);
+  if (FILE* r = std::fopen((g_dir / "retires.txt").string().c_str(), "w")) {
+    for (size_t i = 0; i < g_retires.size(); i++) std::fprintf(r, "%s%d", i ? "," : "", g_retires[i]);
+    std::fprintf(r, "\n");
+    std::fclose(r);
+  }
   g_frame = nullptr;
   g_phase = Phase::kDone;
   REXLOG_INFO("[capture] terminée : {} dessins", g_draw);
@@ -472,6 +482,9 @@ void Render(uint32_t op, const uint8_t* base) {
   if (g_phase != Phase::kRecording || !Ptr(op, 0x18)) return;
   const State& s = g_state;
   FILE* f = g_frame;
+  // Validation du tri des blocs (torchlight_blocs = 2) : dessins qui auraient été retirés, pour l'outil hors ligne
+  // (EXCLURE=$(cat retires.txt)).
+  if (torchlight::blocs::Marked(Load32(base, op))) g_retires.push_back(g_draw);
   std::fprintf(f, "draw %d\n", g_draw++);
   std::fprintf(f, "prog %s %s\n", Hex(s.program_hash[0], 16).c_str(), Hex(s.program_hash[1], 16).c_str());
 

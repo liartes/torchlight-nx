@@ -42,10 +42,17 @@
 #include "torchlight_invite.h"
 #include "torchlight_natif.h"
 
+namespace torchlight::blocs {
+void NoteProgram(const std::string& target, const std::string& source);
+}
+
 REXCVAR_DEFINE_BOOL(torchlight_trace, false, "Torchlight",
                     "Tracer le rendu (appels du D3D9RenderSystem d'Ogre, sources HLSL) dans trace/")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(torchlight_natif_liaisons, true, "Torchlight",
+                    "Rendu natif seul : SetStreamSource et SetIndices du Direct3D du jeu sautés (fences des tampons)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(torchlight_trace_objets, false, "Torchlight",
                     "Vidages d'objets pour la cartographie (trace/objets.txt) : lourds, à n'activer qu'au besoin")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -789,6 +796,7 @@ void DumpHlsl(PPCContext& ctx, uint8_t* base) {
   // Rendu natif : compilation de la source en SPIR-V sur cette machine (cache), une fois par source. Hors du
   // verrou du traceur : le thread de rendu le prend à chaque liaison de programme, il n'a pas à attendre la
   // compilation (200 ms par shader sur la console).
+  torchlight::blocs::NoteProgram(target, text);
   torchlight::natif::ShaderSource(h, target, entry, text, ctx.r9.u32);
   if (!g_write) return;
   std::lock_guard<std::mutex> lock(g_file_mutex);
@@ -923,6 +931,30 @@ REX_HOOK_RAW(sub_821D0A10) {
   if (torchlight::trace::t_skip_d3d_draw) return;
   __imp__sub_821D0A10(ctx, base);
 }
+
+// SetStreamSource (sub_821C3D58) et SetIndices (sub_821C39F8) du Direct3D Xbox, appelés par setVertexBufferBinding,
+// _render et les déliaisons du périphérique (sub_821CECF0, sub_827746B0) ; aucun appelant ne lit r3 ensuite. Ils
+// n'écrivent que dans le périphérique (tampon lié, constante de lecture des sommets, masque des états à envoyer) et
+// posent sur le tampon remplacé la fence du tampon de commandes en cours (+8, ou une entrée en attente par
+// sub_82775DF8). En rendu natif seul, le GPU émulé ne dessine plus (dessins sautés) et le rendu natif a copié les
+// tampons au relevé : sautés (--torchlight_natif_liaisons=false : exécutés). Mesuré sur PC (2026-10-20) : les Lock
+// n'attendaient déjà plus (Lock sans attente ci-dessous) et l'envoi du tampon de commandes pendant un Lock reste
+// rare dans les deux cas ; le gain est le coût des appels eux-mêmes (~4 par dessin). D'après torchlight-recomp de
+// YaPeL (https://github.com/YaPeL/torchlight-recomp, GPL-3.0, docs/native-skip-guest-d3d.md, « Draw and bindings »).
+#define TL_DEVICE_D3D(addr)                                   \
+  REX_EXTERN(__imp__sub_##addr);                              \
+  REX_HOOK_RAW(sub_##addr) {                                  \
+    if (torchlight::trace::SkipBindings()) return;            \
+    __imp__sub_##addr(ctx, base);                             \
+  }
+namespace torchlight::trace {
+bool SkipBindings() {
+  static const bool option = REXCVAR_GET(torchlight_natif_liaisons);
+  return option && torchlight::natif::DrawsHandled();
+}
+}  // namespace torchlight::trace
+TL_DEVICE_D3D(821C3D58)  // SetStreamSource
+TL_DEVICE_D3D(821C39F8)  // SetIndices
 
 // Verrouillage des tampons de sommets et d'indices par Ogre (Lock du Direct3D Xbox : sub_821A70D8 sommets,
 // sub_8276BA90 indices -> sub_821A6D90 ; r3 = objet Direct3D, adresse en +0x18).
@@ -1285,7 +1317,7 @@ TL_SLOT(82572A50, 26)  // _useLights
 // case 27 (areFixedFunctionLightsInViewSpace) : sub_828AD748, fonction partagée avec le reste du jeu (pas de compteur)
 TL_SLOT(824C3CB8, 29)  // _setWorldMatrices
 TL_SLOT(821C93A0, 32)  // _setTextureUnitSettings
-TL_SLOT(821D2530, 36)  // _setPointSpritesEnabled
+TL_SLOT_D3D(821D2530, 36)  // _setPointSpritesEnabled (__SetRenderState seulement)
 TL_SLOT_D3D(821C56A0, 37)  // _setPointParameters
 TL_SLOT(824C39D8, 38)  // _setTexture
 TL_SLOT(821CA710, 40)  // _setVertexTexture
@@ -1312,7 +1344,7 @@ TL_SLOT(82573AB0, 77)  // _makeProjectionMatrix
 TL_SLOT(82572970, 78)  // _makeProjectionMatrix
 TL_SLOT(821ABAE8, 79)  // _makeOrthoMatrix
 TL_SLOT(82573C80, 80)  // _applyObliqueDepthProjection
-TL_SLOT(821C5228, 81)  // _setPolygonMode
+TL_SLOT_D3D(821C5228, 81)  // _setPolygonMode (__SetRenderState seulement)
 TL_SLOT(825730A0, 82)  // setStencilCheckEnabled
 TL_SLOT(825730F8, 83)  // setStencilBufferParams
 TL_SLOT(824C2F98, 88)  // getDriverVersion

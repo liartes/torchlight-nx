@@ -1898,3 +1898,219 @@ REX_HOOK_RAW(sub_821C8C00) {
   UpdateControllers(ctx, base, ctx.r3.u32, mode == 2);
   if (mode == 2) Report();
 }
+
+// --- Écouteur par objet du RT Shader System (sub_821C4F50 : SGRenderObjectListener::notifyRenderSingleObject) ---
+// D'après torchlight-recomp de YaPeL (https://github.com/YaPeL/torchlight-recomp, GPL-3.0 :
+// src/hooks/rtss_listener_hooks.cpp, guest_abi/rtss_listener.h), relu dans notre code généré. Appelé pour chaque
+// objet de chaque passe (sub_821C4EE0) : r3 écouteur, r4 Renderable, r5 Pass, r6 AutoParamDataSource, r7 LightList,
+// r8 suppressRenderStateChanges. Si le ShaderGenerator (+4) a un viewport actif (+328) : recherche du SGPass de la
+// passe dans ses liaisons (Pass +368 : UserObjectBindings, attributs +4, map<String, Any>* +8 ; nœud : clé
+// std::string +12, Any +40, isnil +49 ; clé statique 0x8349D2A4), any_cast (holder<SGPass*>, vtable 0x82000B8C,
+// valeur +4), puis pour chaque sous-état de son état cible (+20 ; vecteur +8..+12) updateGpuProgramsParams [5]
+// (sous-état, objet, mDstPass +12, source, lumières), dans l'ordre. Recherche et cast en natif ; les sous-états
+// restent ceux du jeu. Attributs pas encore alloués (getUserAny les alloue) ou autre type : l'original.
+// Validation (mode 2) : SGPass trouvé comparé à celui de getUserAny (sub_821C0568) et any_cast (sub_821BFC88).
+REX_EXTERN(__imp__sub_821C4F50);
+REX_EXTERN(__imp__sub_821C0568);
+
+namespace {
+
+constexpr uint32_t kSgPassKey = 0x8349D2A4, kSgPassHolder = 0x82000B8C;
+
+// std::string MSVC : tampon de 16 octets ou pointeur en +0, taille +0x10, capacité +0x14.
+struct GuestString {
+  const uint8_t* data;
+  uint32_t size;
+};
+
+GuestString ViewString(const uint8_t* base, uint32_t s) {
+  const uint32_t size = Load32(base, s + 0x10), cap = Load32(base, s + 0x14);
+  return {base + (cap >= 16 ? Load32(base, s) : s), size};
+}
+
+int CompareStrings(const GuestString& a, const GuestString& b) {
+  const uint32_t n = std::min(a.size, b.size);
+  const int c = n ? std::memcmp(a.data, b.data, n) : 0;
+  if (c) return c < 0 ? -1 : 1;
+  return a.size < b.size ? -1 : (a.size > b.size ? 1 : 0);
+}
+
+enum class SgLookup { kNothing, kGuest, kFound };
+
+// SGPass de la passe ; kGuest : à laisser à l'original.
+SgLookup FindSgPass(const uint8_t* base, uint32_t pass, uint32_t& sg_pass) {
+  const uint32_t attributes = Load32(base, pass + 368 + 4);
+  if (!attributes) return SgLookup::kGuest;
+  const uint32_t map = Load32(base, attributes + 8);
+  if (!map) return SgLookup::kNothing;
+  const GuestString key = ViewString(base, kSgPassKey);
+  const uint32_t head = Load32(base, map + 4);
+  uint32_t node = Load32(base, head + 4), candidate = head;
+  while (!base[node + 49]) {
+    if (CompareStrings(ViewString(base, node + 12), key) < 0) {
+      node = Load32(base, node + 8);
+    } else {
+      candidate = node;
+      node = Load32(base, node);
+    }
+  }
+  if (candidate == head || CompareStrings(key, ViewString(base, candidate + 12)) < 0) return SgLookup::kNothing;
+  const uint32_t content = Load32(base, candidate + 40 + 4);
+  if (!content) return SgLookup::kNothing;
+  if (Load32(base, content) != kSgPassHolder) return SgLookup::kGuest;
+  sg_pass = Load32(base, content + 4);
+  return SgLookup::kFound;
+}
+
+uint64_t g_rtss_checked = 0, g_rtss_guest = 0, g_rtss_diffs = 0;
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821C4F50) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821C4F50(ctx, base);
+  const uint32_t self = ctx.r3.u32, rend = ctx.r4.u32, pass = ctx.r5.u32, source = ctx.r6.u32, lights = ctx.r7.u32;
+  const bool suppress = (ctx.r8.u32 & 0xFF) != 0;
+  const uint32_t owner = Load32(base, self + 4);
+  if (!base[owner + 328]) return;
+  uint32_t sg_pass = 0;
+  const SgLookup found = FindSgPass(base, pass, sg_pass);
+  if (found == SgLookup::kGuest) {
+    g_rtss_guest++;
+    return __imp__sub_821C4F50(ctx, base);
+  }
+  if (mode == 2) {
+    // getUserAny (attributs déjà alloués : sans effet de bord) puis contenu de l'Any.
+    ctx.r3.u64 = pass + 368;
+    ctx.r4.u64 = kSgPassKey;
+    __imp__sub_821C0568(ctx, base);
+    const uint32_t content = Load32(base, ctx.r3.u32 + 4);
+    const uint32_t guest = content && Load32(base, content) == kSgPassHolder ? Load32(base, content + 4) : 0;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (guest != (found == SgLookup::kFound ? sg_pass : 0)) {
+      g_diffs.fetch_add(1, std::memory_order_relaxed);
+      g_rtss_diffs++;
+    }
+    if (++g_rtss_checked % 200000 == 0)
+      REXLOG_INFO("[ogre natif] écouteur du RT Shader System : {} recherches comparées, {} différences, {} par "
+                  "l'original", g_rtss_checked, g_rtss_diffs, g_rtss_guest);
+    Report();
+  }
+  if (found != SgLookup::kFound || !sg_pass) return;
+  const uint32_t state = Load32(base, sg_pass + 20);
+  if (!state || suppress) return;
+  const uint32_t dst_pass = Load32(base, sg_pass + 12);
+  uint32_t it = Load32(base, state + 8);
+  if (it == Load32(base, state + 12)) return;
+  do {
+    const uint32_t sub = Load32(base, it);
+    ctx.r3.u64 = sub;
+    ctx.r4.u64 = rend;
+    ctx.r5.u64 = dst_pass;
+    ctx.r6.u64 = source;
+    ctx.r7.u64 = lights;
+    GuestFunc(base, Slot(base, sub, 20))(ctx, base);
+    it += 4;
+  } while (it != Load32(base, state + 12));
+}
+
+// --- AnimationTrack::getKeyFramesAtTime (sub_821CCC60, fonction feuille) ---
+// Console (2026-10-15) : 0,84 % du thread principal en temps propre en jeu. r3 piste (images clés : vecteur de
+// pointeurs +4..+8, temps de l'image clé +4 ; index global -> local : tableau de u16 en +32 ; animation +20, durée
+// +92), r4 TimeIndex (temps +0, index global +4, -1 sinon), r5 image clé 1, r6 image clé 2, r7 index (u16*, peut être
+// nul). Sans index global, le temps est ramené dans la durée (soustractions tant qu'il la dépasse), puis
+// lower_bound sur les temps. Rend le facteur d'interpolation (f1). Opérations en float comme le jeu (fsubs, fadds,
+// fdivs : arrondis identiques, le recompilé arrondit chaque résultat double en float).
+REX_EXTERN(__imp__sub_821CCC60);
+
+namespace {
+
+struct KeyFrames {
+  uint32_t kf1, kf2;
+  uint16_t index;
+  float t;
+};
+
+KeyFrames KeyFramesAtTime(const uint8_t* base, uint32_t track, uint32_t time_index) {
+#pragma clang fp contract(off)
+  float t = LoadFloat(base, time_index);
+  const uint32_t key_index = Load32(base, time_index + 4);
+  const float zero = LoadFloat(base, kConstants + 68);
+  const uint32_t begin = Load32(base, track + 4);
+  uint32_t it;
+  if (key_index != 0xFFFFFFFFu) {
+    const uint32_t map = Load32(base, track + 32);
+    const uint32_t local = (uint32_t(base[map + 2 * key_index]) << 8) | base[map + 2 * key_index + 1];
+    it = begin + 4 * local;
+  } else {
+    const float length = LoadFloat(base, Load32(base, track + 20) + 92);
+    if (t > length) {
+      while (length > zero) {
+        t = t - length;
+        if (!(t > length)) break;
+      }
+    }
+    uint32_t first = begin;
+    int32_t count = int32_t(Load32(base, track + 8) - begin) >> 2;
+    while (count > 0) {
+      const int32_t half = count / 2;
+      const uint32_t mid = first + 4 * uint32_t(half);
+      if (LoadFloat(base, Load32(base, mid) + 4) < t) {
+        first = mid + 4;
+        count -= half + 1;
+      } else {
+        count = half;
+      }
+    }
+    it = first;
+  }
+  KeyFrames r{};
+  float t2;
+  if (it == Load32(base, track + 8)) {
+    r.kf2 = Load32(base, begin);
+    t2 = LoadFloat(base, Load32(base, track + 20) + 92) + LoadFloat(base, r.kf2 + 4);
+    it -= 4;
+  } else {
+    r.kf2 = Load32(base, it);
+    t2 = LoadFloat(base, r.kf2 + 4);
+    if (it != Load32(base, track + 4) && t < LoadFloat(base, Load32(base, it) + 4)) it -= 4;
+  }
+  r.index = uint16_t((it - Load32(base, track + 4)) >> 2);
+  r.kf1 = Load32(base, it);
+  const float t1 = LoadFloat(base, r.kf1 + 4);
+  r.t = zero;
+  if (!(t1 == t2)) r.t = (t - t1) / (t2 - t1);
+  return r;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821CCC60) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821CCC60(ctx, base);
+  const uint32_t track = ctx.r3.u32, ti = ctx.r4.u32, out1 = ctx.r5.u32, out2 = ctx.r6.u32, out_index = ctx.r7.u32;
+  const KeyFrames r = KeyFramesAtTime(base, track, ti);
+  if (mode == 2) {
+    __imp__sub_821CCC60(ctx, base);
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t expected = BitsOf(double(r.t));
+    bool same = BitsOf(ctx.f1.f64) == expected && Load32(base, out1) == r.kf1 && Load32(base, out2) == r.kf2;
+    if (out_index) same = same && ((uint32_t(base[out_index]) << 8 | base[out_index + 1]) == r.index);
+    static uint64_t checked = 0, diffs = 0;
+    if (!same) {
+      g_diffs.fetch_add(1, std::memory_order_relaxed);
+      diffs++;
+    }
+    if (++checked % 500000 == 0)
+      REXLOG_INFO("[ogre natif] getKeyFramesAtTime : {} appels comparés, {} différences", checked, diffs);
+    Report();
+    return;
+  }
+  Store32(base, out2, r.kf2);
+  if (out_index) {
+    base[out_index] = uint8_t(r.index >> 8);
+    base[out_index + 1] = uint8_t(r.index);
+  }
+  Store32(base, out1, r.kf1);
+  ctx.f1.f64 = double(r.t);
+}

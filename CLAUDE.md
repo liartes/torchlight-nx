@@ -6,19 +6,47 @@ Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'e
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
 ## État et reprise (session du 2026-10-14, soir)
-- REPRENDRE ICI (2026-10-15, soir). Version 1.0.2 préparée, NON PUBLIÉE : dist/torchlight-nx-1.0.2.zip (MD5
+- REPRENDRE ICI (2026-10-20). Version 1.0.3 préparée, NON PUBLIÉE : dist/torchlight-nx-1.0.3.zip (MD5 eec6c786,
+  .nro MD5 50b23a21, ELF switch/elf/torchlight-joueurs-1.0.3-20261020-1620.elf ; profil PGO de pgo/ du 2026-10-20,
+  session 3, aucune incompatibilité), texte dist/RELEASE-1.0.3.md (sans chiffres). Contenu depuis la 1.0.2 : blocs
+  de géométrie statique hors de l'écran retirés (src/torchlight_blocs.cpp ; console : mine ~+30 % d'images/s, ville
+  ~+5 %), liaisons de tampons sautées, écouteur du RT Shader System et getKeyFramesAtTime en natif ; d'après
+  torchlight-recomp (YaPeL), crédité dans README et THIRD_PARTY_NOTICES. torchlight-nx : commit local de
+  synchronisation, push à la demande ; release v1.0.3 à créer par l'utilisateur. Essai de la build des joueurs sur
+  la console à faire avant la publication. Zips publiés gardés : dist/torchlight-nx-1.0.1-publie.zip (ff78834e),
+  dist/torchlight-nx-1.0.2-publie.zip (f6f94267).
+- 1.0.2 publiée le 2026-10-15 (torchlight-nx 6f0b346, release faite par l'utilisateur) : dist/torchlight-nx-1.0.2.zip
+  (MD5
   f6f94267, .nro MD5 d6685a15, ELF switch/elf/torchlight-joueurs-1.0.2-20261015-2011.elf ; profil PGO de pgo/ du
   2026-10-15 soir, aucune incompatibilité), texte de release dist/RELEASE-1.0.2.md (performances seulement, sans
-  chiffres, à la demande de l'utilisateur ; README sans chiffres d'images/s non plus). torchlight-nx : commit local
-  de synchronisation, push et release GitHub à faire par/à la demande de l'utilisateur. Zip 1.0.1 publié gardé :
+  chiffres, à la demande de l'utilisateur ; README sans chiffres d'images/s non plus). Build des joueurs vérifiée
+  sur la console XJE1 sans torchlight.toml (switch-logs-archive/20261015-joueurs-102/). torchlight-nx 6f0b346
+  « torchlight-nx 1.0.2 », poussé sur GitHub le 2026-10-15 ; release v1.0.2 créée par l'utilisateur (zip +
+  dist/RELEASE-1.0.2.md). Zip 1.0.1 publié gardé :
   dist/torchlight-nx-1.0.1-publie.zip (MD5 ff78834e).
   Contenu depuis la 1.0.1 : appels indirects promus, constantes de .rdata, chargements flottants, -fno-math-errno,
   registres locaux (feuilles, boucles), natives walkOctree / largeur des textes de CEGUI / contrôleurs, relevé
   préchargé, -ffp-contract=off pour les natives. Dialogues vérifiés sur la console. Mesure du soir (build de test
   équivalente, fréquences de base) : ville 272-277 dessins 20,2-20,9 ms (36-38 images/s) ; mine 198-199 dessins
   15,6-15,9 ms (41-42) ; pas de référence 1.0.1 valable à 1600 MHz (celles du 2026-10-14 étaient à 2400).
+  Depuis la 1.0.2 (2026-10-20, d'après torchlight-recomp de YaPeL, https://github.com/YaPeL/torchlight-recomp,
+  GPL-3.0, clone de lecture dans le bloc-notes de session) : liaisons de tampons, mode polygone et sprites du
+  Direct3D du jeu sautés (src/torchlight_trace.cpp, torchlight_natif_liaisons) ; blocs de géométrie statique hors
+  de l'écran non mis en file pour la caméra principale (src/torchlight_blocs.cpp, torchlight_blocs 0/1/2), validé
+  à l'octet sur PC (mine, ville, outil hors ligne avec EXCLURE) ; A/B sur la console aux fréquences de base : ville
+  ~-4 % (39-40 -> 41-42 images/s), mine ~-28 % (33-35 -> 44-45). Essai : dist/torchlight-essai-blocs.nro (non
+  publié). Copie de la sauvegarde de la console (5 personnages) : switch/out-pc/donnees-console-20261020 (manette
+  « 15:a,20:a,25:a » : plus d'appuis ouvrent un dialogue). Sur PC, --torchlight_natif_seul=true n'est pas activé par
+  défaut (piège des A/B). Leur dépôt offre aussi : écouteur du RT Shader System en natif, mods PC (dossier
+  replacements simple ; mods de données moyen ; nouveaux objets lourd), icônes de boutons Nintendo (Kenney, CC0).
   Pistes restantes (< 1,2 % chacune) : addRenderable sub_821C3730, BillboardRenderer sub_821DA090,
   getSquaredViewDepth sub_821C4DF8, recherche par nom sub_821C04C8.
+  Pas encore fait : A/B propre des natives sur la console (même build, même endroit, torchlight_ogre_natif = 0 dans
+  torchlight.toml puis 1) ; mesure de la 1.0.1 aux fréquences de base. À savoir : GCC (Switch, mode GNU) contracte
+  aussi a * b + c en fma dans le code généré pour les opérations en double précision (fmul puis fadd du jeu) :
+  écart possible avec le PowerPC, jamais observé ; -ffp-contract=off seulement sur torchlight_ogre_natif.cpp.
+  Une native ajoutée : ses appels déjà figés en __imp__sub_X dans le code généré sont à remettre en sub_X (sed),
+  appels_directs.py les respecte ensuite (adresse citée dans src/).
   Méthode de mesure : personnage immobile 1 min en ville puis dans la mine juste après l'arrivée, mêmes endroits,
   et TOUJOURS vérifier la ligne « relojes » de rex_perfil.log des deux sessions (une session est passée à 2400 MHz
   de mémoire sans que l'utilisateur le sache : profil sys-clk du jeu ?). Avant de supprimer le .nro de la console,
@@ -194,7 +222,7 @@ D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
 - switch/build_joueurs.sh : build LTO + PGO sans outils de développement (-DTORCHLIGHT_OUTILS=OFF : manette de script
   et capture d'écran ; TORCHLIGHT_NATIF reste) dans switch/out-joueurs, puis dist/torchlight-nx-<version>.zip
   (switch/torchlight/ : .nro, README.md, LICENSE, THIRD_PARTY_NOTICES.md). Version : TORCHLIGHT_VERSION dans
-  switch/CMakeLists.txt (1.0.2).
+  switch/CMakeLists.txt (1.0.3).
 - Lancement en mode applet (album) : message bloquant à l'écran (appletGetAppletType != Application) au lieu du
   simple avertissement du SDK.
 - Le .nro contient le code de default.xex recompilé (comme les .nro de nfsmw-nx) : zone grise assumée dans le README ;

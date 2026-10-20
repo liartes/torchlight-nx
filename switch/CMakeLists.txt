@@ -14,7 +14,7 @@ project(torchlight LANGUAGES CXX)
 
 # Nom public du projet : torchlight-nx (portage non officiel ; menu homebrew, zip des joueurs). Version affichée par
 # le menu homebrew et nom du zip (switch/build_joueurs.sh).
-set(TORCHLIGHT_VERSION "1.0.2")
+set(TORCHLIGHT_VERSION "1.0.3")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,7 +33,7 @@ add_compile_options("-fmacro-prefix-map=${TORCHLIGHT_ESPACE}/=")
 include(generated/rexglue.cmake)
 
 add_executable(torchlight ../src/main.cpp ../src/torchlight_trace.cpp ../src/torchlight_manette.cpp
-    ../src/torchlight_capture.cpp ../src/torchlight_natif.cpp ../src/torchlight_crt.cpp ../src/torchlight_ogre_natif.cpp ../src/torchlight_pgo.cpp ../src/natif/rendu.cpp
+    ../src/torchlight_capture.cpp ../src/torchlight_natif.cpp ../src/torchlight_crt.cpp ../src/torchlight_ogre_natif.cpp ../src/torchlight_blocs.cpp ../src/torchlight_pgo.cpp ../src/natif/rendu.cpp
     ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp
     ${REXSDK_DIR}/thirdparty/glslang/StandAlone/ResourceLimits.cpp)
 target_include_directories(torchlight PRIVATE ../src)

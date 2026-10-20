@@ -1071,3 +1071,65 @@ l'émulation GPU.
   switch-logs-archive/20261015-essai-natives/. Aucune référence 1.0.1 valable aux fréquences de base (les sessions
   du 2026-10-14 tournaient à 2400 MHz de mémoire) : pas de chiffre publié. README : chiffres d'images/s retirés
   (variables selon les lieux et les réglages), sa2-nx dans les remerciements.
+- 2026-10-20 : **revue de torchlight-recomp (YaPeL, https://github.com/YaPeL/torchlight-recomp, GPL-3.0, portage
+  PC du même jeu)** pour la Switch. Mêmes options du générateur que nous ; leurs contrôleurs en natif et les dcbt du
+  jeu : sans gain (comme chez nous). Retenu, dans l'ordre : liaisons des tampons sautées (fait, ci-dessous), blocs de
+  géométrie statique (StaticGeometry::GeometryBucket) hors de l'écran non mis en file pour la caméra principale
+  (boîte par bloc et par morceau ; chez eux +10 % en combat, ~+6 % en ville, images identiques), écouteur du RT
+  Shader System en natif (sub_821C4F50), _setTextureBlendMode (sub_821C9100) et champs non initialisés des modes de
+  mélange d'Ogre 1.7 (notre relevé recopie les 15 mots tels quels : faux états possibles).
+- 2026-10-20 : **SetStreamSource (sub_821C3D58) et SetIndices (sub_821C39F8) du Direct3D Xbox sautés en rendu natif
+  seul** (`--torchlight_natif_liaisons`, vrai par défaut), ainsi que _setPolygonMode (case 81) et
+  _setPointSpritesEnabled (case 36), qui n'appellent que __SetRenderState (sub_821C5480). Appelants : setVertex-
+  BufferBinding, _render, déliaisons du périphérique (sub_821CECF0, sub_827746B0) ; aucun ne lit r3 ensuite ; rien
+  chez nous ne lit l'état du périphérique qu'ils écrivent. Mesures sur PC (avec --torchlight_natif_seul=true : sur
+  PC il n'est pas activé par défaut, piège qui avait faussé un premier A/B) : il ne reste qu'une attente du GPU par
+  image (présentation, retour 821F37CC) ; l'envoi du tampon de commandes pendant un Lock est rare avec comme sans ;
+  temps « image » dans le bruit du PC (7,5-7,9 ms contre 7,5-8,6 ms en paires alternées). Captures identiques hormis
+  ce qui bouge. À mesurer sur la console (A/B par l'option, même build).
+- 2026-10-20 : **blocs de géométrie statique hors de l'écran non mis en file pour la caméra principale**
+  (src/torchlight_blocs.cpp, `--torchlight_blocs` : 0 comme le jeu, 1 retirés (défaut), 2 validation ; rendu natif
+  seul ; d'après le « bucket culling » de torchlight-recomp). Chaque StaticGeometry::GeometryBucket (vtable
+  0x820016B4) reçoit une boîte (tous ses sommets, espace de sa région) et jusqu'à 16 boîtes de morceaux (composantes
+  connexes de ses triangles, regroupées par coupes médianes), calculées au premier passage, oubliées à sa destruction
+  (sub_8247F728) ; pendant _findVisibleObjects (sub_821A6070) du viewport de la scène (gardé par CreateViewports,
+  sub_8220A470, +0x48 ; SceneManager +0xA8), un bloc dont aucune boîte (transformée par le nœud de la région, +0xE4,
+  calculs en double et petite marge) ne touche le frustum de la caméra n'atteint pas RenderQueue::addRenderable
+  (sub_821C3730). Coupé pour la session si un programme de sommets ne place pas la position comme le RT Shader
+  System (transformation fixe ou animation matérielle). Validation (mode 2) : rien n'est retiré, la capture liste les
+  dessins qui l'auraient été (trace/capture/retires.txt, seulement entre le parcours principal et le suivant : la
+  carte de lumière dessine les mêmes blocs) ; l'outil hors ligne rend l'image avec et sans eux (EXCLURE). PC, deux
+  zones de la mine : 286 -> 212 dessins (74 blocs sur 158 testés) et 192 -> 155 (37 sur 92), images **identiques à
+  l'octet**. PC, A/B alterné au même endroit : 287 -> 212 dessins, image côté jeu 4,4-4,7 -> 3,8-4,0 ms (~-14 %).
+  Ville (sauvegarde de la console copiée le 2026-10-20 dans switch/out-pc/donnees-console-20261020, personnage 3,
+  manette « 15:a,20:a,25:a » : au-delà, les appuis sur A ouvrent le dialogue d'un PNJ voisin et la caméra zoome) :
+  304 -> 283 dessins (21 blocs sur 132), identiques à l'octet ; la scène du dialogue zoomé aussi (237 -> 218).
+  À mesurer sur la console (A/B par l'option, même build, après le PGO).
+- 2026-10-20 : **A/B sur la console du tri des blocs et du saut des liaisons** (même .nro, dist/torchlight-essai-
+  blocs.nro, MD5 41ee123e, LTO + PGO du 2026-10-20 ; ELF switch/elf/torchlight-essai-blocs-20261020-*.elf ; session 1
+  avec torchlight.toml « torchlight_blocs = 0, torchlight_natif_liaisons = false », session 2 sans ; fréquences de
+  base dans les deux sessions, CPU 1020 / GPU 307,2 / mémoire 1600 ; personnage immobile aux mêmes endroits ;
+  journaux switch-logs-archive/20261020-ab-sans/ et 20261020-ab-avec/) :
+  - ville : 277-284 dessins, 19,3-20,0 ms, 39-40 images/s -> 245-247 dessins, 18,7-18,9 ms, 41-42 images/s
+    (22 blocs retirés sur 128 testés par parcours ; ~-4 %) ;
+  - mine : 379-386 dessins, 22,5-23,6 ms, 33-35 images/s -> 206 dessins, 16,5-17,1 ms, 44-45 images/s
+    (148 blocs retirés sur 229 ; ~-28 %, +30 % d'images/s).
+  Le saut des liaisons n'est pas mesuré à part (les deux changements ensemble). Pendant la session PGO, la
+  mémoire était à 2400 MHz (sans effet sur le profil) : vérifier le profil sys-clk du jeu avant chaque mesure.
+- 2026-10-20 : **écouteur par objet du RT Shader System en natif** (sub_821C4F50, src/torchlight_ogre_natif.cpp ;
+  d'après torchlight-recomp, relu dans notre code généré : propriétaire +4, drapeau +328, clé 0x8349D2A4, liaisons
+  de la passe +368, SGPass +12/+20, sous-états +8/+12 appelés par la case 5, fin du vecteur relue à chaque tour
+  comme le jeu). Recherche du SGPass (std::map<String, Any>, any_cast) en natif, sous-états du jeu ; attributs non
+  alloués ou autre type : l'original. Appel promu de sub_821C4EE0 remis en sub_X (fichier 137). Validation (mode 2,
+  getUserAny et any_cast du jeu comparés) : ville et mine, 2,2 millions de recherches, 0 différence. perf sur PC
+  (ville, part du processus) : écouteur et recherche 0,79 % -> 0,64 % : gain faible (le reste est la boucle des
+  sous-états et les nœuds de la map en mémoire). À mesurer sur la console avec la suite.
+- 2026-10-20 : **_setTextureBlendMode (sub_821C9100)** : piste de torchlight-recomp déjà couverte chez nous (sautée
+  en rendu natif seul depuis le 2026-10-02 ; ses seules écritures sont des membres +144 + 32 * unité, et un calcul de
+  couleur VMX dont le résultat reste sur la pile). **AnimationTrack::getKeyFramesAtTime (sub_821CCC60) en natif**
+  (fonction feuille, 0,84 % du thread principal sur la console en jeu) : temps ramené dans la durée, lower_bound sur
+  les temps des images clés, facteur d'interpolation en float comme le jeu. Validation (mode 2, sorties et f1 au bit
+  près) : ville et mine, 6,5 millions d'appels, 0 différence.
+- 2026-10-20 : **version 1.0.3 préparée** (build des joueurs, LTO + PGO de la session 3 du 2026-10-20, aucune
+  incompatibilité du profil) : dist/torchlight-nx-1.0.3.zip (MD5 eec6c786, .nro 50b23a21), texte
+  dist/RELEASE-1.0.3.md ; README : torchlight-recomp dans les remerciements.
