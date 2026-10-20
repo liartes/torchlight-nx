@@ -1133,3 +1133,49 @@ l'émulation GPU.
 - 2026-10-20 : **version 1.0.3 préparée** (build des joueurs, LTO + PGO de la session 3 du 2026-10-20, aucune
   incompatibilité du profil) : dist/torchlight-nx-1.0.3.zip (MD5 eec6c786, .nro 50b23a21), texte
   dist/RELEASE-1.0.3.md ; README : torchlight-recomp dans les remerciements.
+- 2026-10-20 : **essai de la build des joueurs 1.0.3 sur la console** (sans torchlight.toml) : démarrage, ville, mine,
+  sortie normale, aucune erreur, fréquences de base (switch-logs-archive/20261020-joueurs-103/). L'utilisateur a vu
+  le halo au sol du feu de la place s'éclairer d'un coup en partant vers la gauche. Sur PC (personnage 3, stick à
+  gauche, captures de 38 à 46 s dont le feu en bord d'écran) : images avec et sans les blocs retirés identiques à
+  l'octet. Sur la console avec `torchlight_blocs = 0` : le halo varie de même (session sans bilan [blocs],
+  switch-logs-archive/20261020-halo-sans-blocs/) : effet du jeu (probablement la carte de lumière, cible 208, et sa
+  propre caméra), pas du tri. torchlight.toml retiré ensuite.
+- 2026-10-20 : **deux pistes de Torchlight Rekindled (GreenSwampDweller, https://github.com/GreenSwampDweller/torchlight-rekindled,
+  GPL-3.0 ; moteur réécrit d'après le code Xbox, OGRE 14 et GL) mesurées sur le profil de la console du lot 2**
+  (pilas-archive/rex_pilas-20261015-lot2.txt avec switch/elf/torchlight-essai-lot2-20261014-2156.elf ; les fichiers
+  rex_pilas-20261015-1451/1846/1914 de l'archive sont des copies identiques de celui-ci). (1) Table des passes de la
+  file de rendu (leur correctif OGRE 0019) : le visiteur groupé du jeu est sub_821CC700 (variante de Runic : pour
+  chaque passe de la map, copie les renderables, les trie par l'échelle de lumière +0x1c et rappelle la passe quand
+  elle change, comme le décrit leur light_override). Entrées vides sautées (début == fin du vecteur) ; leur parcours
+  (lecture du vecteur de chaque nœud, 0x22670 de l'ELF, et incrément d'arbre en ligne) ~0,8 % du thread principal en
+  jeu, temps propre total de la fonction 1,6 %. Pas de copie de shared_ptr comme dans OGRE 14 : gain plafonné à
+  ~0,15 ms par image, pour une native avec suivi des entrées non vides depuis addRenderable : écarté. (2) Index du
+  zip (leur 0010) : le jeu passe par zziplib (ZipArchive d'Ogre 1.7) ; ouverture d'entrée sub_82589D10 0,45 % de la
+  session, presque tout en lecture ; aucune recherche de nom visible au chargement (lectures fsdev 7,6 %,
+  décompression sub_823E31D8 3 %, allocateur sub_821CD7F8 3 %, texte de CEGUI) : écarté.
+- 2026-10-20 : **profil de la console avec la 1.0.3** (build des joueurs, .nro 50b23a21, pilas-on, ~5 min aux
+  fréquences de base, relojes vérifiés ; pilas-archive/rex_pilas-20261020-2334.txt avec
+  switch/elf/torchlight-joueurs-1.0.3-20261020-1620.elf, switch-logs-archive/20261020-pilas-103/). console.sh
+  journaux archive désormais le nouveau relevé, une seule fois (empreinte). Tranches de 5 % du thread principal :
+  ville 2-8 (35-37 images/s, ~280 dessins), donjon 11-18 (mine 42-43 puis zone lourde 17-24 images/s, 300-395
+  dessins). Répartition (ville / donjon) : renderOneFrame sub_821B07F0 73 / 74 % dont cibles de rendu sub_821F26B0
+  40 / 33 % (renderSingleObject 23 / 18 %), recherche des objets visibles sub_821A6070 20 / 20 % (WalkOctree natif
+  5,2 / 6,2 % propre ; Region::_updateRenderQueue de la géométrie statique sub_821CCE90 5,4 % dont notre test des
+  blocs Outside 1,9 / 1,4 % propre), contrôleurs sub_821C8C00 7,9 / 15,6 % (ParticleSystem::_update sub_821C8618
+  5,6 / 10 %, dont sub_821C81F8 -> sub_821C7B88 émetteurs/particules 4,2 / 6,5 %) ; logique du jeu sub_821F5CA0
+  22 / 21 %, plate (squelettes natifs ~3 %). Pistes : (1) Outside : la géométrie statique ne bouge pas, garder les
+  boîtes déjà transformées tant que la matrice du nœud est la même (~2,7 µs par bloc testé aujourd'hui) ;
+  (2) particules du jeu en natif (gros morceau, surtout dans les donjons).
+- 2026-10-21 : **boîtes des blocs gardées, préchargement des contrôleurs et systèmes de particules arrêtés en natif**
+  (commit 4587fcb). Blocs : boîtes transformées (centre, demi-étendue) gardées par bloc tant que les 16 mots de la
+  matrice du nœud sont les mêmes ; PC, ancien et nouveau calcul côte à côte : 260 000 tests, 0 écart. Contrôleurs :
+  PC, ~700 systèmes de ParticleUniverse par image en ville (80 actifs), ~1 100 dans la mine (260 actifs) ;
+  préchargement par vagues (contrôleurs, destinations, systèmes, techniques des actifs) puis parcours inchangé ;
+  ParticleSystemUpdateValue d'un système arrêté (état 2 ou 3 : compteur +280 jusqu'à 900) en natif, compteur à 799
+  laissé au jeu ; validation (mode 2) ville et mine : 0 différence. A/B sur la console (fréquences de base, XJE1,
+  sans torchlight.toml ; A : build des joueurs 1.0.3, switch-logs-archive/20261021-ab-103/ ; B :
+  dist/torchlight-essai-particules.nro, MD5 2ab596e4, ELF switch/elf/torchlight-essai-particules-20261021-0010.elf,
+  switch-logs-archive/20261021-ab-essai/). Ville, même endroit (133/20 et 132/22 blocs testés/retirés) : A 271-277
+  dessins, 20,96-21,40 ms (32-36 images/s) ; B 266-270 dessins, 20,61-20,83 ms (36-37) : ~-2 %, à la limite du
+  bruit. Mine : A 195 dessins 17,6-17,7 ms (45 images/s) ; B sans fenêtre immobile comparable (personnage en
+  mouvement, 208-293 dessins). Aucune erreur.

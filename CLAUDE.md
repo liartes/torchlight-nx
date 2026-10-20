@@ -6,15 +6,21 @@ Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'e
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
 ## État et reprise (session du 2026-10-14, soir)
-- REPRENDRE ICI (2026-10-20). Version 1.0.3 préparée, NON PUBLIÉE : dist/torchlight-nx-1.0.3.zip (MD5 eec6c786,
-  .nro MD5 50b23a21, ELF switch/elf/torchlight-joueurs-1.0.3-20261020-1620.elf ; profil PGO de pgo/ du 2026-10-20,
-  session 3, aucune incompatibilité), texte dist/RELEASE-1.0.3.md (sans chiffres). Contenu depuis la 1.0.2 : blocs
-  de géométrie statique hors de l'écran retirés (src/torchlight_blocs.cpp ; console : mine ~+30 % d'images/s, ville
-  ~+5 %), liaisons de tampons sautées, écouteur du RT Shader System et getKeyFramesAtTime en natif ; d'après
-  torchlight-recomp (YaPeL), crédité dans README et THIRD_PARTY_NOTICES. torchlight-nx : commit local de
-  synchronisation, push à la demande ; release v1.0.3 à créer par l'utilisateur. Essai de la build des joueurs sur
-  la console à faire avant la publication. Zips publiés gardés : dist/torchlight-nx-1.0.1-publie.zip (ff78834e),
-  dist/torchlight-nx-1.0.2-publie.zip (f6f94267).
+- REPRENDRE ICI (2026-10-21). Version 1.0.3 refaite, NON PUBLIÉE : dist/torchlight-nx-1.0.3.zip (MD5 febc143e,
+  .nro MD5 7e0d5f10, ELF switch/elf/torchlight-joueurs-1.0.3-20261021-0039.elf ; profil PGO de pgo/ du 2026-10-20,
+  session 3 : UpdateControllers, ControllerDestination et Outside compilées sans profil, modifiées depuis), texte
+  dist/RELEASE-1.0.3.md (sans chiffres). Premier zip 1.0.3 (sans les changements du 2026-10-21) gardé :
+  dist/torchlight-nx-1.0.3-premier.zip (eec6c786). Contenu depuis la 1.0.2 : blocs de géométrie statique hors de
+  l'écran retirés (src/torchlight_blocs.cpp ; console : mine ~+30 % d'images/s, ville ~+5 % ; boîtes transformées
+  gardées depuis le 2026-10-21), liaisons de tampons sautées, écouteur du RT Shader System et getKeyFramesAtTime en
+  natif (d'après torchlight-recomp de YaPeL, crédité dans README et THIRD_PARTY_NOTICES) ; préchargement des
+  contrôleurs et systèmes de particules arrêtés en natif (2026-10-21, à nous). A/B de ces derniers sur la console :
+  ville ~-2 %, mine pas encore comparée (journal). torchlight-nx : resynchroniser (commit local e5a064b dépassé),
+  push à la demande ; release v1.0.3 à créer par l'utilisateur. Essai de cette build des joueurs sur la console à
+  faire avant la publication. Zips publiés gardés : dist/torchlight-nx-1.0.1-publie.zip (ff78834e),
+  dist/torchlight-nx-1.0.2-publie.zip (f6f94267). Profil de la console de la 1.0.3 (2026-10-20) :
+  pilas-archive/rex_pilas-20261020-2334.txt ; prochaine piste : particules de ParticleUniverse (sub_821C8618 et
+  dessous, ~10 % du thread dans les donjons, surtout des attentes de la mémoire).
 - 1.0.2 publiée le 2026-10-15 (torchlight-nx 6f0b346, release faite par l'utilisateur) : dist/torchlight-nx-1.0.2.zip
   (MD5
   f6f94267, .nro MD5 d6685a15, ELF switch/elf/torchlight-joueurs-1.0.2-20261015-2011.elf ; profil PGO de pgo/ du

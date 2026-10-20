@@ -65,9 +65,19 @@ struct Box {
   double min[3], max[3];
 };
 
+// Boîte transformée sous la forme que lit le test du frustum : centre et demi-étendue.
+struct WorldBox {
+  double center[3], half[3];
+};
+
 struct Shape {
   Box whole;
   std::vector<Box> pieces;  // vide : la boîte entière seule
+  // Boîtes sous la dernière transformation vue du nœud (world[0] : la boîte entière, puis les morceaux) : le décor ne
+  // bouge pas, elles ne sont refaites que si les 16 mots de la matrice changent.
+  bool world_valid = false;
+  uint32_t world_key[16];
+  std::vector<WorldBox> world;
 };
 
 int g_mode = 0;               // 0 coupé, 1 retirer, 2 valider
@@ -276,16 +286,25 @@ Box Transform(const Box& b, const double m[16]) {
 }
 
 // Frustum::isVisible(boîte) d'Ogre : invisible seulement si la boîte est entièrement du côté extérieur d'un plan.
-bool Visible(const Box& b) {
+bool Visible(const WorldBox& b) {
   for (const auto& p : g_planes) {
     double dist = p[3], extent = 0;
     for (int i = 0; i < 3; i++) {
-      dist += p[i] * (b.min[i] + b.max[i]) * 0.5;
-      extent += std::fabs(p[i] * (b.max[i] - b.min[i]) * 0.5);
+      dist += p[i] * b.center[i];
+      extent += std::fabs(p[i] * b.half[i]);
     }
     if (dist < -extent) return false;
   }
   return true;
+}
+
+WorldBox ToWorldBox(const Box& b) {
+  WorldBox w;
+  for (int i = 0; i < 3; i++) {
+    w.center[i] = (b.min[i] + b.max[i]) * 0.5;
+    w.half[i] = (b.max[i] - b.min[i]) * 0.5;
+  }
+  return w;
 }
 
 void ReadPlanes(const uint8_t* base) {
@@ -317,13 +336,26 @@ bool Outside(const uint8_t* base, uint32_t bucket) {
   const uint32_t region = Ptr(lod, 8) ? Load32(base, lod + 4) : 0;
   const uint32_t node = Ptr(region, 0x30) ? Load32(base, region + kMovableParentNode) : 0;
   if (!Ptr(node, kNodeTransformOutOfDate + 4) || base[node + kNodeTransformOutOfDate]) return false;
-  double m[16];
-  for (int i = 0; i < 16; i++) m[i] = LoadFloat(base, node + kNodeTransform + 4 * i);
-  const Shape& s = *it->second;
-  if (!Visible(Transform(s.whole, m))) return true;
+  Shape& s = *it->second;
+  uint32_t key[16];
+  for (int i = 0; i < 16; i++) key[i] = Load32(base, node + kNodeTransform + 4 * i);
+  if (!s.world_valid || std::memcmp(key, s.world_key, sizeof key) != 0) {
+    double m[16];
+    for (int i = 0; i < 16; i++) {
+      float f;
+      std::memcpy(&f, &key[i], 4);
+      m[i] = f;
+    }
+    s.world.clear();
+    s.world.push_back(ToWorldBox(Transform(s.whole, m)));
+    for (const Box& piece : s.pieces) s.world.push_back(ToWorldBox(Transform(piece, m)));
+    std::memcpy(s.world_key, key, sizeof key);
+    s.world_valid = true;
+  }
+  if (!Visible(s.world[0])) return true;
   if (s.pieces.empty()) return false;
-  for (const Box& piece : s.pieces)
-    if (Visible(Transform(piece, m))) return false;
+  for (size_t i = 1; i < s.world.size(); i++)
+    if (Visible(s.world[i])) return false;
   return true;
 }
 

@@ -112,12 +112,18 @@ case "$cmd" in
     mkdir -p "$DEST"
     # Échantillons bruts du profileur gardés (ordre des fonctions : switch/tools/ordre_fonctions.py en a besoin avec
     # l'ELF du .nro testé) : pilas-archive/, jamais versionné.
-    if [ -s "$DEST/rex/rex_pilas.txt" ]; then
-      mkdir -p "$ROOT/pilas-archive"
-      cp "$DEST/rex/rex_pilas.txt" "$ROOT/pilas-archive/rex_pilas-$(date -r "$DEST/rex/rex_pilas.txt" +%Y%m%d-%H%M).txt"
-    fi
     find "$DEST" -mindepth 1 -delete
     cp -r "$T/logs/." "$DEST/"
+    # Archivé après la copie, et seulement s'il est nouveau : avant, le fichier local précédent était recopié à
+    # chaque appel (trois copies identiques du lot 2 le 2026-10-15).
+    if [ -s "$DEST/rex/rex_pilas.txt" ]; then
+      mkdir -p "$ROOT/pilas-archive"
+      somme="$(md5sum < "$DEST/rex/rex_pilas.txt" | cut -d' ' -f1)"
+      if ! md5sum "$ROOT"/pilas-archive/*.txt 2>/dev/null | grep -q "^$somme "; then
+        cp "$DEST/rex/rex_pilas.txt" "$ROOT/pilas-archive/rex_pilas-$(date +%Y%m%d-%H%M).txt"
+        echo "relevé des piles archivé dans pilas-archive/"
+      fi
+    fi
     echo "copié dans $DEST :"
     (cd "$DEST" && find . -type f | sort | sed 's/^/  /')
     if [ "${2:-}" = "--vider" ]; then

@@ -1827,8 +1827,40 @@ double ControllerFunction(PPCContext& ctx, uint8_t* base, uint32_t func, uint32_
   return ctx.f1.f64;
 }
 
+// sub_821C8A58 (ParticleUniverse::ParticleSystemUpdateValue::setValue), système (+4) arrêté ou en pause (état +284 =
+// 2 ou 3 ; ~90 % des ~700 systèmes d'une image en ville) : compteur +280 augmenté tant qu'il est sous 900 ; quand il
+// atteint 800, l'original prévient aussi le rendu de chaque technique : ce cas (compteur à 799) et les systèmes
+// actifs restent au jeu.
+bool IdleParticleSystem(uint8_t* base, uint32_t dest) {
+  const uint32_t sys = Load32(base, dest + 4);
+  const int32_t state = int32_t(Load32(base, sys + 284));
+  if (state != 2 && state != 3) return false;
+  const int32_t count = int32_t(Load32(base, sys + 280));
+  if (count == 799) return false;
+  if (count < 900) Store32(base, sys + 280, uint32_t(count + 1));
+  return true;
+}
+
 void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t dest, uint32_t entry, double value, bool check) {
   if (entry == 0x821D2E50 && !check) return TexCoordModifier(base, dest, value);
+  if (entry == 0x821C8A58) {
+    if (!check) {
+      if (IdleParticleSystem(base, dest)) return;
+    } else {
+      const uint32_t sys = Load32(base, dest + 4), saved_count = Load32(base, sys + 280);
+      const bool handled = IdleParticleSystem(base, dest);
+      const uint32_t expected_count = Load32(base, sys + 280);
+      Store32(base, sys + 280, saved_count);
+      ctx.r3.u64 = dest;
+      ctx.f1.f64 = value;
+      __imp__sub_821C8A58(ctx, base);
+      if (handled) {
+        g_calls.fetch_add(1, std::memory_order_relaxed);
+        if (Load32(base, sys + 280) != expected_count) Diff();
+      }
+      return;
+    }
+  }
   uint8_t saved[24], expected[24];
   const uint32_t tus = Load32(base, dest + 12);
   const bool known = entry == 0x821D2E50 && tus;
@@ -1852,6 +1884,53 @@ void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t dest, uint32
   }
 }
 
+// Préchargement avant le parcours (console, 2026-10-20 : dans les donjons, contrôleurs et particules ~16 % du thread
+// principal, surtout des attentes de la mémoire, un objet après l'autre : l'état +284 de chaque système de particules
+// coûte à lui seul la plupart du temps propre de sub_821C8A58). Les objets sont demandés par vagues : contrôleurs,
+// destinations, systèmes de ParticleUniverse (destination ParticleSystemUpdateValue, sub_821C8A58 en [2] : système
+// +4), puis, pour les systèmes qui se mettent à jour (état +284 ni 2 ni 3, nœud +40, +45), leurs lignes lues par
+// ParticleSystem::_update (sub_821C8618) et celles de leurs techniques (vecteur +348..+352) lues par
+// ParticleTechnique::_update (sub_821C7B88) et ses appels. Lectures seulement, des mêmes adresses que le parcours.
+void PrefetchControllers(const uint8_t* base, uint32_t head) {
+  static std::vector<uint32_t> ctrls, systems;
+  ctrls.clear();
+  systems.clear();
+  for (uint32_t n = Load32(base, head); n != head; n = TreeNext<17>(base, n)) {
+    const uint32_t c = Load32(base, n + 12);
+    __builtin_prefetch(base + c + 8);
+    __builtin_prefetch(base + c + 52);
+    ctrls.push_back(c);
+  }
+  for (uint32_t c : ctrls) __builtin_prefetch(base + Load32(base, c + 24));
+  for (uint32_t c : ctrls) {
+    if (!base[c + 52]) continue;
+    const uint32_t dest = Load32(base, c + 24);
+    if (Load32(base, Load32(base, dest) + 8) != 0x821C8A58) continue;
+    const uint32_t sys = Load32(base, dest + 4);
+    __builtin_prefetch(base + sys + 280);
+    systems.push_back(sys);
+  }
+  size_t running = 0;
+  for (uint32_t sys : systems) {
+    const uint32_t state = Load32(base, sys + 284);
+    if (state == 2 || state == 3) continue;
+    systems[running++] = sys;
+    __builtin_prefetch(base + sys + 40);
+    __builtin_prefetch(base + sys + 348);
+    __builtin_prefetch(base + sys + 437);
+    __builtin_prefetch(base + sys + 488);
+  }
+  systems.resize(running);
+  for (uint32_t sys : systems) {
+    if (!Load32(base, sys + 40) || !base[sys + 45]) continue;
+    const uint32_t end = Load32(base, sys + 352);
+    for (uint32_t t = Load32(base, sys + 348); t != end; t += 4) {
+      const uint8_t* tech = base + Load32(base, t);
+      for (uint32_t off : {92u, 140u, 216u, 264u, 304u, 584u, 684u, 720u, 768u}) __builtin_prefetch(tech + off);
+    }
+  }
+}
+
 void UpdateControllers(PPCContext& ctx, uint8_t* base, uint32_t self, bool check) {
   const uint32_t frame = Load32(base, Load32(base, kRootSingleton) + 224);
   if (frame == Load32(base, self + 56)) return;
@@ -1859,6 +1938,7 @@ void UpdateControllers(PPCContext& ctx, uint8_t* base, uint32_t self, bool check
   Store32(base, sp, old_sp);
   ctx.r1.u64 = sp;
   const uint32_t head = Load32(base, self + 8);
+  PrefetchControllers(base, head);
   for (uint32_t n = Load32(base, head); n != head;) {
     const uint32_t ctrl = Load32(base, n + 12);
     if (base[ctrl + 52]) {
