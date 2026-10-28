@@ -20,6 +20,7 @@ run.txt
 /.claude/settings.local.json
 
 /pgo/
+/pgo-*/
 /pilas-archive/
 
 # Journaux récupérés de la console (switch/console.sh journaux) et archives

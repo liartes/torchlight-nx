@@ -6,20 +6,57 @@ Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'e
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
 ## État et reprise (session du 2026-10-14, soir)
-- REPRENDRE ICI (2026-10-21). Version 1.0.3 refaite, NON PUBLIÉE : dist/torchlight-nx-1.0.3.zip (MD5 febc143e,
-  .nro MD5 7e0d5f10, ELF switch/elf/torchlight-joueurs-1.0.3-20261021-0039.elf ; profil PGO de pgo/ du 2026-10-20,
-  session 3 : UpdateControllers, ControllerDestination et Outside compilées sans profil, modifiées depuis), texte
-  dist/RELEASE-1.0.3.md (sans chiffres). Premier zip 1.0.3 (sans les changements du 2026-10-21) gardé :
-  dist/torchlight-nx-1.0.3-premier.zip (eec6c786). Contenu depuis la 1.0.2 : blocs de géométrie statique hors de
-  l'écran retirés (src/torchlight_blocs.cpp ; console : mine ~+30 % d'images/s, ville ~+5 % ; boîtes transformées
-  gardées depuis le 2026-10-21), liaisons de tampons sautées, écouteur du RT Shader System et getKeyFramesAtTime en
-  natif (d'après torchlight-recomp de YaPeL, crédité dans README et THIRD_PARTY_NOTICES) ; préchargement des
-  contrôleurs et systèmes de particules arrêtés en natif (2026-10-21, à nous). A/B de ces derniers sur la console :
-  ville ~-2 %, mine pas encore comparée (journal). torchlight-nx : resynchroniser (commit local e5a064b dépassé),
-  push à la demande ; release v1.0.3 à créer par l'utilisateur. Essai de cette build des joueurs sur la console à
-  faire avant la publication. Zips publiés gardés : dist/torchlight-nx-1.0.1-publie.zip (ff78834e),
+- REPRENDRE ICI (2026-10-28, soir). **1.0.3 publiée** (commit et push de torchlight-nx le 2026-10-28 ; release v1.0.3
+  à créer par l'utilisateur avec dist/torchlight-nx-1.0.3.zip, MD5 259af13c, .nro 3e94a750 =
+  dist/torchlight-joueurs-1.0.3-20261028-2037.nro, ELF switch/elf/torchlight-joueurs-1.0.3-20261028-2037.elf ; texte
+  dist/RELEASE-1.0.3.md). Profil PGO de pgo/ : session 5 du 2026-10-28 (combats compris) ; précédents dans
+  pgo-20261028/ et pgo-20261021/. Vérifiée sur la console XJE1 sans torchlight.toml (switch-logs-archive/
+  20261028-joueurs-final/) : ville 242 dessins 18,25-18,4 ms (42 images/s), combat ~370 dessins ~32 ms (37 ms avec
+  le jeu d'origine), mode boost pendant tous les chargements et jamais en combat ; chargements plus courts
+  (utilisateur). Contenu depuis la 1.0.2 : voir dist/RELEASE-1.0.3.md et la fin du journal (blocs hors écran,
+  liaisons sautées, natives d'après torchlight-recomp ; boucle des contrôleurs en liste plate ; particules sur
+  plusieurs cœurs, src/torchlight_particules.cpp ; natives de la logique et du rendu ; mode boost des chargements,
+  src/torchlight_boost.cpp). Crédits ajoutés : torchlight-rekindled (README, THIRD_PARTY_NOTICES, release).
+  Pistes restantes (journal, 2026-10-28) : sommets des billboards en parallèle (~1,5-2 % en combat, étude faite) ;
+  délai de sortie du mode boost à 1 s (les chargements apparaissent en plusieurs morceaux dans le journal). Le jeu
+  est limité par son thread principal (GPU sans effet, CPU à 1224 MHz : +12 % en ville).
+  Piège : build_joueurs.sh refait toujours l'édition des liens (le .nro change) ; pour refaire seulement le zip,
+  le reconstruire à la main avec le .nro testé.
+  Code généré modifié (non versionné, à refaire après une régénération) : appels remis en sub_X pour les
+  interceptions des particules (sub_821CCDD0, sub_8258F8F8, sub_825A4C68, sub_8247A588, sub_821A1CA8) et des natives
+  (sub_821D7D38, sub_82312D98, sub_821CC998, sub_821CF100), en plus de ceux du 2026-10-27 ci-dessous.
+  Fait le 2026-10-27 (commits 5cc256b, 5d60883 ; détail : fin du journal) : boucle des contrôleurs en liste plate,
+  dormants sautés (--torchlight_controleurs 1 par défaut, 0 = référence A/B) ; préchargement par vagues retiré (il
+  ralentissait) ; natives de la logique sub_821A1510 (recherche par nom) et sub_822F92A0 (rejet du segment contre les
+  objets). Console (fréquences de base, sans relevé), contre la 1.0.3 refaite : mine 16,3 -> 14,7-14,8 ms par image
+  (48 -> 50-51 images/s), ville 19,2 -> 18,1-18,4 ms (41 -> 42) ; combat ~20-30 images/s selon la charge. Dernière
+  build mesurée : dist/torchlight-essai-natives-logique.nro (8ced7bbf, ELF
+  switch/elf/torchlight-essai-natives-logique-20261027-2030.elf ; profil pilas-archive/rex_pilas-20261027-2102.txt).
+  Code généré modifié (non versionné, garder tel quel : la build PGO s'appuie dessus) : appels figés remis en sub_X
+  pour sub_821A1510 (~90 fichiers), sub_822F92A0 (6, 64), createController sub_824B4C78 (9 fichiers), ~Controller
+  sub_824B5A10 (216). Écarté : poses des squelettes en parallèle (torchlight-rekindled ; la logique de Runic pose
+  chaque unité pendant sa mise à jour, le report serait risqué) ; dessin trop plat pour une réécriture rentable
+  (notre relevé natif::Render ~4,8 % en combat : cache des objets d'Ogre par dessin possible, ~1 %).
+  Recouvrir logique et rendu (~30 %) : hors de portée (scène partagée).
+- Point de reprise précédent (2026-10-21, fin de session). Version 1.0.3 refaite, NON PUBLIÉE : dist/torchlight-nx-1.0.3.zip
+  (MD5 febc143e, .nro MD5 7e0d5f10, ELF switch/elf/torchlight-joueurs-1.0.3-20261021-0039.elf ; profil PGO de pgo/
+  du 2026-10-20, session 3 : UpdateControllers, ControllerDestination et Outside compilées sans profil, modifiées
+  depuis), texte dist/RELEASE-1.0.3.md (sans chiffres). Premier zip 1.0.3 (sans les changements du 2026-10-21)
+  gardé : dist/torchlight-nx-1.0.3-premier.zip (eec6c786). Contenu depuis la 1.0.2 : blocs de géométrie statique
+  hors de l'écran retirés (src/torchlight_blocs.cpp ; console : mine ~+30 % d'images/s, ville ~+5 % ; boîtes
+  transformées gardées depuis le 2026-10-21), liaisons de tampons sautées, écouteur du RT Shader System et
+  getKeyFramesAtTime en natif (d'après torchlight-recomp de YaPeL, crédité dans README et THIRD_PARTY_NOTICES) ;
+  préchargement des contrôleurs et systèmes de particules arrêtés en natif (2026-10-21, à nous).
+  ATTENTION : la build des joueurs refaite (7e0d5f10) est plus lente dans la mine que le premier zip (19,0-19,2 ms
+  contre 17,6-17,7, même endroit ; ville sans gain ; journal, 2026-10-21). Prochaine étape (décidée) : build
+  instrumentée PGO (OUT=switch/out-pgo, -DTORCHLIGHT_PGO=generer -DTORCHLIGHT_LTO=OFF), session de jeu,
+  console.sh pgo, build des joueurs, nouvelle mesure ville + mine immobile ; si la mine reste lente : A/B par options
+  (préchargement des contrôleurs, systèmes arrêtés) dans un même .nro. Ne rien publier avant ; repli possible :
+  dist/torchlight-nx-1.0.3-premier.zip. La console XJE1 a la build refaite (7e0d5f10). torchlight-nx : commit local
+  5c064de (synchronisé avec la build refaite, à refaire si le code change), push à la demande ; release v1.0.3 à
+  créer par l'utilisateur. Zips publiés gardés : dist/torchlight-nx-1.0.1-publie.zip (ff78834e),
   dist/torchlight-nx-1.0.2-publie.zip (f6f94267). Profil de la console de la 1.0.3 (2026-10-20) :
-  pilas-archive/rex_pilas-20261020-2334.txt ; prochaine piste : particules de ParticleUniverse (sub_821C8618 et
+  pilas-archive/rex_pilas-20261020-2334.txt ; piste suivante : particules de ParticleUniverse (sub_821C8618 et
   dessous, ~10 % du thread dans les donjons, surtout des attentes de la mémoire).
 - 1.0.2 publiée le 2026-10-15 (torchlight-nx 6f0b346, release faite par l'utilisateur) : dist/torchlight-nx-1.0.2.zip
   (MD5

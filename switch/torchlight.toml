@@ -37,6 +37,14 @@ nfsmw_io_rangos_mb = 0
 # 1 = retirés (défaut), 2 = validation (rien de retiré, liste dans la capture). Images identiques.
 # torchlight_blocs = 0
 
+# Systèmes de ParticleUniverse mis à jour sur d'autres cœurs (src/torchlight_particules.cpp) : 0 = comme le jeu,
+# 1 = mis de côté puis en série (validation), 2 = en parallèle (défaut). Particules équivalentes, pas identiques.
+# torchlight_particules = 0
+
+# Mode boost du processeur (FastLoad du système : processeur à 1785 MHz, GPU au minimum) pendant les chargements,
+# quand le jeu ne finit plus ses images (src/torchlight_boost.cpp) : vrai par défaut.
+# torchlight_boost_chargement = false
+
 # SetStreamSource et SetIndices du Direct3D du jeu sautés en rendu natif seul (vrai par défaut).
 # torchlight_natif_liaisons = false
 

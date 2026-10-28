@@ -9,6 +9,13 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 OUT="$HERE/out-joueurs"
+# Ninja ne suit pas les .gcda : objets compilés avec un profil plus ancien que pgo/ supprimés (sinon seule l'édition
+# des liens est refaite, avec l'ancien profil).
+if [ -d "$ROOT/pgo" ] && [ -d "$OUT/CMakeFiles" ]; then
+    PROFIL="$(ls -t "$ROOT"/pgo/*.gcda | head -1)"
+    find "$OUT/CMakeFiles/torchlight_recomp.dir" "$OUT/CMakeFiles/torchlight.dir" -name '*.obj' ! -newer "$PROFIL" \
+        -delete 2>/dev/null || true
+fi
 OUT="$OUT" CMAKE_OPTIONS="-DTORCHLIGHT_LTO=ON -DTORCHLIGHT_PILE_NON_VOLATILE=ON -DTORCHLIGHT_PGO=utiliser \
 -DTORCHLIGHT_OUTILS=OFF" "$HERE/build_switch.sh"
 

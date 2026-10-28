@@ -34,7 +34,7 @@ include(generated/rexglue.cmake)
 
 add_executable(torchlight ../src/main.cpp ../src/torchlight_trace.cpp ../src/torchlight_manette.cpp
     ../src/torchlight_capture.cpp ../src/torchlight_natif.cpp ../src/torchlight_crt.cpp ../src/torchlight_ogre_natif.cpp ../src/torchlight_blocs.cpp ../src/torchlight_pgo.cpp ../src/natif/rendu.cpp
-    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp
+    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp ../src/torchlight_particules.cpp ../src/torchlight_boost.cpp
     ${REXSDK_DIR}/thirdparty/glslang/StandAlone/ResourceLimits.cpp)
 target_include_directories(torchlight PRIVATE ../src)
 # Rendu natif : empreintes des textures avec XXH3 (rex/hash.h), en-tête du SDK non exporté par ses cibles.

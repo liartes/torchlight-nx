@@ -43,6 +43,7 @@
 #include "natif/ffp_sources.h"
 #include "natif/hlsl_compiler.h"
 #include "natif/rendu.h"
+#include "torchlight_boost.h"
 #include "torchlight_capture.h"
 #include "torchlight_invite.h"
 
@@ -870,6 +871,7 @@ void BeginGameFrame() {
 }
 
 void EndGameFrame() {
+  torchlight::boost::Image();  // mode boost pendant les chargements (src/torchlight_boost.cpp)
   if (!Active()) return;
   g_in_game_frame = false;
   Frame* f = g_cur;

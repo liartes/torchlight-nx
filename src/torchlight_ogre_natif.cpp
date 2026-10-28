@@ -5,12 +5,14 @@
 // est calculé à côté et les différences sont comptées (bilan dans le journal toutes les 10 s).
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -20,8 +22,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "torchlight_particules.h"
+
 REXCVAR_DEFINE_INT32(torchlight_ogre_natif, 1, "Torchlight",
                      "Fonctions chaudes d'Ogre en C++ natif : 0 = recompilé, 1 = natif, 2 = valider contre le recompilé")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(torchlight_controleurs, 1, "Torchlight",
+                     "Boucle des contrôleurs : 0 = parcours du std::set, systèmes arrêtés laissés au jeu (comme le "
+                     "premier zip de la 1.0.3, pour les A/B) ; 1 = liste plate, contrôleurs dormants sautés")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace torchlight::ogre {
@@ -1735,9 +1744,13 @@ REX_HOOK_RAW(sub_821B3C88) {
 // destination (+24) setValue [2]. Cas courants en natif (99,9 % des appels d'après le relevé des appels indirects) :
 // source FrameTimeControllerValue (sub_821C8BF8 : +8), fonctions sub_821C8CD8 (getAdjustedInput) et sub_821D2EE0
 // (entrée multipliée par +12, puis getAdjustedInput), destination sub_821D2E50 (modificateur de coordonnées de
-// texture) ; ParticleSystemUpdateValue (sub_821C8A58) et les autres restent ceux du jeu.
+// texture), ParticleSystemUpdateValue (sub_821C8A58) d'un système arrêté ; les systèmes actifs et les autres restent
+// ceux du jeu. Console (2026-10-27, profil de combat) : contrôleurs 17,5 % du thread principal, dont 8,2 % de temps
+// propre de la boucle : ~1 700 contrôleurs par image, dont ~1 300 de systèmes arrêtés qui ne font rien. D'où la liste
+// plate (--torchlight_controleurs=1, plus bas) : mine 4,0 -> 2,0 ms par image, ville 2,1 -> 1,2 ms. Les préchargements
+// par vagues (tous les contrôleurs, ou les seuls systèmes actifs) ralentissaient la console : retirés.
 // Validation (mode 2) : chaque calcul natif comparé à la fonction du jeu sur le même état (sauvegardé puis remis),
-// successeur dans l'arbre comparé à sub_824C6960.
+// successeur dans l'arbre comparé à sub_824C6960 ; liste comparée au set, dormants vérifiés sans effet.
 REX_EXTERN(__imp__sub_821C8C00);
 REX_EXTERN(__imp__sub_821C8A58);
 REX_EXTERN(__imp__sub_821C8CD8);
@@ -1841,11 +1854,20 @@ bool IdleParticleSystem(uint8_t* base, uint32_t dest) {
   return true;
 }
 
-void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t dest, uint32_t entry, double value, bool check) {
+// --torchlight_controleurs=0 : systèmes arrêtés laissés au jeu (comme le premier zip de la 1.0.3), pour l'A/B.
+int ControllersVariant() {
+  static const int variant = REXCVAR_GET(torchlight_controleurs);
+  return variant;
+}
+
+void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t ctrl, uint32_t dest, uint32_t entry, double value,
+                           bool check) {
   if (entry == 0x821D2E50 && !check) return TexCoordModifier(base, dest, value);
-  if (entry == 0x821C8A58) {
+  if (entry == 0x821C8A58 && ControllersVariant() != 0) {
     if (!check) {
       if (IdleParticleSystem(base, dest)) return;
+      // Système actif admis : mis à jour à la fin de la boucle, en parallèle (torchlight_particules.cpp).
+      if (torchlight::particules::Prendre(base, ctrl, dest, value)) return;
     } else {
       const uint32_t sys = Load32(base, dest + 4), saved_count = Load32(base, sys + 280);
       const bool handled = IdleParticleSystem(base, dest);
@@ -1884,93 +1906,231 @@ void ControllerDestination(PPCContext& ctx, uint8_t* base, uint32_t dest, uint32
   }
 }
 
-// Préchargement avant le parcours (console, 2026-10-20 : dans les donjons, contrôleurs et particules ~16 % du thread
-// principal, surtout des attentes de la mémoire, un objet après l'autre : l'état +284 de chaque système de particules
-// coûte à lui seul la plupart du temps propre de sub_821C8A58). Les objets sont demandés par vagues : contrôleurs,
-// destinations, systèmes de ParticleUniverse (destination ParticleSystemUpdateValue, sub_821C8A58 en [2] : système
-// +4), puis, pour les systèmes qui se mettent à jour (état +284 ni 2 ni 3, nœud +40, +45), leurs lignes lues par
-// ParticleSystem::_update (sub_821C8618) et celles de leurs techniques (vecteur +348..+352) lues par
-// ParticleTechnique::_update (sub_821C7B88) et ses appels. Lectures seulement, des mêmes adresses que le parcours.
-void PrefetchControllers(const uint8_t* base, uint32_t head) {
-  static std::vector<uint32_t> ctrls, systems;
-  ctrls.clear();
-  systems.clear();
-  for (uint32_t n = Load32(base, head); n != head; n = TreeNext<17>(base, n)) {
-    const uint32_t c = Load32(base, n + 12);
-    __builtin_prefetch(base + c + 8);
-    __builtin_prefetch(base + c + 52);
-    ctrls.push_back(c);
+// Bilan toutes les 10 s : contrôleurs par image, dormants sautés, temps de la boucle (particules actives comprises).
+struct CtrlStats {
+  uint64_t frames = 0, total = 0, skipped = 0, rebuilds = 0, resumed = 0, inserted = 0, removed = 0;
+  double prefetch_ms = 0, loop_ms = 0;
+} g_cs;
+
+void ReportControllers() {
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10) || !g_cs.frames) return;
+  last = now;
+  const double f = double(g_cs.frames);
+  REXLOG_INFO("[contrôleurs] par image : {:.0f} contrôleurs, {:.0f} sautés (dormants) ; ms : liste "
+              "{:.3f}, total {:.3f} ; listes refaites {}, reprises dans le set {}, insertions {}, retraits {}",
+              (g_cs.total + g_cs.skipped) / f, g_cs.skipped / f, g_cs.prefetch_ms / f, g_cs.loop_ms / f, g_cs.rebuilds,
+              g_cs.resumed, g_cs.inserted, g_cs.removed);
+  g_cs = CtrlStats{};
+}
+
+// Un contrôleur : source (+8) getValue [1], fonction (+40) calculate [1], destination (+24) setValue [2], s'il est
+// actif (+52).
+void UpdateController(PPCContext& ctx, uint8_t* base, uint32_t ctrl, bool check) {
+  g_cs.total++;
+  if (!base[ctrl + 52]) return;
+  const uint32_t src = Load32(base, ctrl + 8), func = Load32(base, ctrl + 40), dest = Load32(base, ctrl + 24);
+  const uint32_t func_vt = Load32(base, func), dest_vt = Load32(base, dest);
+  const uint32_t get = Slot(base, src, 4);
+  double v;
+  if (get == 0x821C8BF8) {
+    v = double(LoadFloat(base, src + 8));
+  } else {
+    ctx.r3.u64 = src;
+    GuestFunc(base, get)(ctx, base);
+    v = ctx.f1.f64;
   }
-  for (uint32_t c : ctrls) __builtin_prefetch(base + Load32(base, c + 24));
-  for (uint32_t c : ctrls) {
-    if (!base[c + 52]) continue;
-    const uint32_t dest = Load32(base, c + 24);
-    if (Load32(base, Load32(base, dest) + 8) != 0x821C8A58) continue;
-    const uint32_t sys = Load32(base, dest + 4);
-    __builtin_prefetch(base + sys + 280);
-    systems.push_back(sys);
-  }
-  size_t running = 0;
-  for (uint32_t sys : systems) {
-    const uint32_t state = Load32(base, sys + 284);
-    if (state == 2 || state == 3) continue;
-    systems[running++] = sys;
-    __builtin_prefetch(base + sys + 40);
-    __builtin_prefetch(base + sys + 348);
-    __builtin_prefetch(base + sys + 437);
-    __builtin_prefetch(base + sys + 488);
-  }
-  systems.resize(running);
-  for (uint32_t sys : systems) {
-    if (!Load32(base, sys + 40) || !base[sys + 45]) continue;
-    const uint32_t end = Load32(base, sys + 352);
-    for (uint32_t t = Load32(base, sys + 348); t != end; t += 4) {
-      const uint8_t* tech = base + Load32(base, t);
-      for (uint32_t off : {92u, 140u, 216u, 264u, 304u, 584u, 684u, 720u, 768u}) __builtin_prefetch(tech + off);
+  v = ControllerFunction(ctx, base, func, Load32(base, func_vt + 4), v, check);
+  ControllerDestination(ctx, base, ctrl, dest, Load32(base, dest_vt + 8), v, check);
+}
+
+// Liste plate des contrôleurs dans l'ordre du std::set (pointeurs croissants), tenue à jour à chaque création
+// (createController sub_824B4C78 : insertion à sa place) et destruction (~Controller sub_824B5A10 : retrait) faite sur
+// le thread de la boucle en dehors de celle-ci ; refaite en entier à l'image suivante sinon (pendant la boucle, autre
+// thread, contrôleur inconnu) ou si la taille du set (+12) diffère.
+// Dormant : source FrameTimeControllerValue, fonction getAdjustedInput sans mDeltaInput (sans état), destination
+// ParticleSystemUpdateValue ; tant que son système est arrêté (état +284 = 2 ou 3) avec le compteur +280 à 900 ou
+// plus, toute sa mise à jour ne fait rien (IdleParticleSystem) : seules la ligne du contrôleur (actif, destination
+// inchangée) et celle du système sont lues. PC, en jeu : ~1 300 dormants sur ~1 700 contrôleurs.
+struct ControllerEntry {
+  uint32_t ctrl, dest, sys;  // sys : système d'un contrôleur qui peut dormir, sinon 0
+};
+std::vector<ControllerEntry> g_controllers;
+std::atomic<bool> g_controllers_dirty{true};
+thread_local bool t_controllers_owner = false;  // thread qui fait la boucle (le principal)
+bool g_controllers_looping = false;
+
+bool CanSleep(const uint8_t* base, uint32_t ctrl) {
+  const uint32_t src = Load32(base, ctrl + 8), func = Load32(base, ctrl + 40), dest = Load32(base, ctrl + 24);
+  return Slot(base, src, 4) == 0x821C8BF8 && Slot(base, func, 4) == 0x821C8CD8 && !base[func + 4] &&
+         Slot(base, dest, 8) == 0x821C8A58;
+}
+
+ControllerEntry MakeEntry(const uint8_t* base, uint32_t ctrl) {
+  const uint32_t dest = Load32(base, ctrl + 24);
+  return {ctrl, dest, CanSleep(base, ctrl) ? Load32(base, dest + 4) : 0u};
+}
+
+void RebuildControllers(const uint8_t* base, uint32_t head) {
+  g_controllers.clear();
+  for (uint32_t n = Load32(base, head); n != head; n = TreeNext<17>(base, n))
+    g_controllers.push_back(MakeEntry(base, Load32(base, n + 12)));
+}
+
+bool IncrementalAllowed() {
+  return t_controllers_owner && !g_controllers_looping && !g_controllers_dirty.load(std::memory_order_relaxed);
+}
+
+void ControllerCreated(const uint8_t* base, uint32_t ctrl) {
+  if (!IncrementalAllowed()) return g_controllers_dirty.store(true, std::memory_order_relaxed);
+  const auto at = std::lower_bound(g_controllers.begin(), g_controllers.end(), ctrl,
+                                   [](const ControllerEntry& e, uint32_t c) { return e.ctrl < c; });
+  if (at != g_controllers.end() && at->ctrl == ctrl) return g_controllers_dirty.store(true, std::memory_order_relaxed);
+  g_controllers.insert(at, MakeEntry(base, ctrl));
+  g_cs.inserted++;
+}
+
+void ControllerDestroyed(uint32_t ctrl) {
+  if (!IncrementalAllowed()) return g_controllers_dirty.store(true, std::memory_order_relaxed);
+  const auto at = std::lower_bound(g_controllers.begin(), g_controllers.end(), ctrl,
+                                   [](const ControllerEntry& e, uint32_t c) { return e.ctrl < c; });
+  if (at == g_controllers.end() || at->ctrl != ctrl) return g_controllers_dirty.store(true, std::memory_order_relaxed);
+  g_controllers.erase(at);
+  g_cs.removed++;
+}
+
+// Premier nœud du std::set<Controller*> (en-tête head : racine +4, valeur +12, isnil +17) de valeur > ctrl.
+uint32_t UpperBound(const uint8_t* base, uint32_t head, uint32_t ctrl) {
+  uint32_t result = head;
+  for (uint32_t x = Load32(base, head + 4); !base[x + 17];) {
+    if (ctrl < Load32(base, x + 12)) {
+      result = x;
+      x = Load32(base, x);
+    } else {
+      x = Load32(base, x + 8);
     }
+  }
+  return result;
+}
+
+bool Asleep(const uint8_t* base, const ControllerEntry& e) {
+  if (!e.sys || !base[e.ctrl + 52] || Load32(base, e.ctrl + 24) != e.dest) return false;
+  const int32_t state = int32_t(Load32(base, e.sys + 284)), count = int32_t(Load32(base, e.sys + 280));
+  return (state == 2 || state == 3) && count >= 900;
+}
+
+// Validation : liste identique au set, et chaque contrôleur sauté vraiment sans effet.
+void CheckControllers(const uint8_t* base, uint32_t head) {
+  size_t i = 0;
+  bool same = true;
+  for (uint32_t n = Load32(base, head); n != head; n = TreeNext<17>(base, n), i++)
+    same = same && i < g_controllers.size() && g_controllers[i].ctrl == Load32(base, n + 12);
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  if (!same || i != g_controllers.size()) Diff();
+  // Reprise dans le set : le successeur de chaque contrôleur est l'entrée suivante de la liste.
+  for (size_t k = 0; same && k < g_controllers.size(); k++) {
+    const uint32_t n = UpperBound(base, head, g_controllers[k].ctrl);
+    const uint32_t expected = k + 1 < g_controllers.size() ? g_controllers[k + 1].ctrl : 0;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if ((n == head ? 0 : Load32(base, n + 12)) != expected) Diff();
+  }
+  for (const ControllerEntry& e : g_controllers) {
+    if (!Asleep(base, e)) continue;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!CanSleep(base, e.ctrl) || Load32(base, e.dest + 4) != e.sys) Diff();
   }
 }
 
 void UpdateControllers(PPCContext& ctx, uint8_t* base, uint32_t self, bool check) {
+  const int variant = ControllersVariant();
   const uint32_t frame = Load32(base, Load32(base, kRootSingleton) + 224);
   if (frame == Load32(base, self + 56)) return;
   const uint32_t old_sp = ctx.r1.u32, sp = old_sp - 160;
   Store32(base, sp, old_sp);
   ctx.r1.u64 = sp;
   const uint32_t head = Load32(base, self + 8);
-  PrefetchControllers(base, head);
-  for (uint32_t n = Load32(base, head); n != head;) {
-    const uint32_t ctrl = Load32(base, n + 12);
-    if (base[ctrl + 52]) {
-      const uint32_t src = Load32(base, ctrl + 8), func = Load32(base, ctrl + 40), dest = Load32(base, ctrl + 24);
-      const uint32_t func_vt = Load32(base, func), dest_vt = Load32(base, dest);
-      const uint32_t get = Slot(base, src, 4);
-      double v;
-      if (get == 0x821C8BF8) {
-        v = double(LoadFloat(base, src + 8));
-      } else {
-        ctx.r3.u64 = src;
-        GuestFunc(base, get)(ctx, base);
-        v = ctx.f1.f64;
+  const auto t0 = std::chrono::steady_clock::now();
+  g_cs.frames++;
+  if (variant != 0) {
+    t_controllers_owner = true;
+    if (g_controllers_dirty.exchange(false) || Load32(base, self + 12) != g_controllers.size()) {
+      RebuildControllers(base, head);
+      g_cs.rebuilds++;
+    }
+    if (check) CheckControllers(base, head);
+    g_controllers_looping = true;
+    const auto t1 = std::chrono::steady_clock::now();
+    g_cs.prefetch_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    constexpr size_t kAhead = 16;
+    const size_t count = g_controllers.size();
+    for (size_t i = 0; i < count; i++) {
+      // Contrôleur créé ou détruit pendant la boucle (par la mise à jour précédente : effet terminé en combat) : la
+      // liste n'est plus sûre. Suite dans le std::set à partir du premier contrôleur d'adresse supérieure à la
+      // dernière entrée traitée (comparaison d'adresses seulement), comme l'itérateur du jeu ; liste refaite à
+      // l'image suivante (drapeau resté levé).
+      if (g_controllers_dirty.load(std::memory_order_relaxed)) {
+        g_cs.resumed++;
+        for (uint32_t n = i ? UpperBound(base, head, g_controllers[i - 1].ctrl) : Load32(base, head); n != head;) {
+          UpdateController(ctx, base, Load32(base, n + 12), check);
+          n = TreeNext<17>(base, n);
+        }
+        break;
       }
-      v = ControllerFunction(ctx, base, func, Load32(base, func_vt + 4), v, check);
-      ControllerDestination(ctx, base, dest, Load32(base, dest_vt + 8), v, check);
+      if (i + kAhead < count) {
+        const ControllerEntry& a = g_controllers[i + kAhead];
+        __builtin_prefetch(base + a.ctrl + 24);
+        if (a.sys) __builtin_prefetch(base + a.sys + 280);
+      }
+      const ControllerEntry& e = g_controllers[i];
+      if (Asleep(base, e)) {
+        g_cs.skipped++;
+        continue;
+      }
+      UpdateController(ctx, base, e.ctrl, check);
     }
-    const uint32_t next = TreeNext<17>(base, n);
-    if (check) {
-      Store32(base, sp + 80, n);
-      ctx.r3.u64 = sp + 80;
-      __imp__sub_824C6960(ctx, base);
-      g_calls.fetch_add(1, std::memory_order_relaxed);
-      if (Load32(base, sp + 80) != next) Diff();
+    g_controllers_looping = false;
+  } else {
+    const auto t1 = std::chrono::steady_clock::now();
+    g_cs.prefetch_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    for (uint32_t n = Load32(base, head); n != head;) {
+      UpdateController(ctx, base, Load32(base, n + 12), check);
+      const uint32_t next = TreeNext<17>(base, n);
+      if (check) {
+        Store32(base, sp + 80, n);
+        ctx.r3.u64 = sp + 80;
+        __imp__sub_824C6960(ctx, base);
+        g_calls.fetch_add(1, std::memory_order_relaxed);
+        if (Load32(base, sp + 80) != next) Diff();
+      }
+      n = next;
     }
-    n = next;
   }
+  torchlight::particules::Executer(ctx, base);
   Store32(base, self + 56, frame);
   ctx.r1.u64 = old_sp;
+  g_cs.loop_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  ReportControllers();
 }
 
 }  // namespace
+
+// ControllerManager::createController (sub_824B4C78, rend le contrôleur) et ~Controller (sub_824B5A10) : liste des
+// contrôleurs tenue à jour.
+REX_EXTERN(__imp__sub_824B4C78);
+REX_EXTERN(__imp__sub_824B5A10);
+// Pendant les mises à jour parallèles des particules : en série, et tâche du contrôleur détruit oubliée.
+REX_HOOK_RAW(sub_824B4C78) {
+  torchlight::particules::Serie serie;
+  __imp__sub_824B4C78(ctx, base);
+  ControllerCreated(base, ctx.r3.u32);
+}
+REX_HOOK_RAW(sub_824B5A10) {
+  torchlight::particules::Serie serie;
+  torchlight::particules::ControleurDetruit(ctx.r3.u32);
+  ControllerDestroyed(ctx.r3.u32);
+  __imp__sub_824B5A10(ctx, base);
+}
 
 REX_HOOK_RAW(sub_821C8C00) {
   const int mode = Mode();
@@ -2193,4 +2353,494 @@ REX_HOOK_RAW(sub_821CCC60) {
   }
   Store32(base, out1, r.kf1);
   ctx.f1.f64 = double(r.t);
+}
+
+// --- Recherche d'un élément par nom (sub_821A1510, logique du jeu) ---
+// Console (2026-10-27, profil de combat) : 1,9 % du thread principal en temps propre, appelée à chaque mise à jour
+// d'unité (sub_821E4588 sous sub_821D3FD8) ; 570 sites d'appel. r3 conteneur (éléments : données +16, nombre +20,
+// capacité +24 ; un indice hors de la capacité prend l'élément 0, comme le jeu), r4 std::wstring cherchée (tampon
+// de 8 caractères ou pointeur +0, taille +16, capacité +20). Pour chaque élément : nom = valeur de l'identifiant
+// (+16) dans la std::map de son objet (+20 ; map +4, en-tête +8, taille +12 ; nœud : clé +12, valeur +16, isnil +45 ;
+// sub_821A1608 et sub_821A1670), chaîne par défaut de l'objet (+80) si la map est vide ou la clé absente, chaîne
+// statique 0x834240CC sans objet ou d'identifiant -1. Premier élément dont le nom est égal (wstring::compare
+// sub_821A1478 nul : même taille, mêmes caractères) rendu, sinon 0.
+REX_EXTERN(__imp__sub_821A1510);
+
+namespace {
+
+constexpr uint32_t kEmptyName = 0x834240CC;
+
+uint32_t ElementName(const uint8_t* base, uint32_t item) {
+  const uint32_t obj = Load32(base, item + 20), id = Load32(base, item + 16);
+  if (!obj || id == 0xFFFFFFFFu) return kEmptyName;
+  if (!Load32(base, obj + 12)) return obj + 80;
+  const uint32_t head = Load32(base, obj + 8);
+  uint32_t found = head;
+  for (uint32_t n = Load32(base, head + 4); !base[n + 45];) {
+    if (Load32(base, n + 12) < id) {
+      n = Load32(base, n + 8);
+    } else {
+      found = n;
+      n = Load32(base, n);
+    }
+  }
+  if (found == head || id < Load32(base, found + 12)) return obj + 80;
+  return found + 16;
+}
+
+bool SameWString(const uint8_t* base, uint32_t s, const uint8_t* key, uint32_t len) {
+  if (Load32(base, s + 16) != len) return false;
+  const uint32_t data = Load32(base, s + 20) >= 8 ? Load32(base, s) : s;
+  return std::memcmp(base + data, key, 2 * size_t(len)) == 0;
+}
+
+uint32_t FindByName(const uint8_t* base, uint32_t cont, uint32_t key) {
+  const uint32_t count = Load32(base, cont + 20), data = Load32(base, cont + 16), cap = Load32(base, cont + 24);
+  const uint32_t len = Load32(base, key + 16);
+  const uint8_t* chars = base + (Load32(base, key + 20) >= 8 ? Load32(base, key) : key);
+  for (uint32_t i = 0; i < count; i++) {
+    const uint32_t item = Load32(base, i < cap ? data + 4 * i : data);
+    if (SameWString(base, ElementName(base, item), chars, len)) return item;
+  }
+  return 0;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821A1510) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821A1510(ctx, base);
+  const uint32_t cont = ctx.r3.u32, key = ctx.r4.u32;
+  if (mode == 1) {
+    ctx.r3.u64 = FindByName(base, cont, key);
+    return;
+  }
+  const uint32_t expected = FindByName(base, cont, key);
+  __imp__sub_821A1510(ctx, base);
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  static uint64_t checked = 0, found = 0, diffs = 0;
+  if (ctx.r3.u32 != expected) {
+    g_diffs.fetch_add(1, std::memory_order_relaxed);
+    diffs++;
+  }
+  if (expected) found++;
+  if (++checked % 100000 == 0)
+    REXLOG_INFO("[ogre natif] recherche par nom : {} appels comparés ({} trouvés), {} différences", checked, found,
+                diffs);
+  Report();
+}
+
+// --- RenderPriorityGroup::clear (sub_821CC998) ---
+// Console (2026-10-28, profil de combat avec les particules en parallèle) : 1,25 % du thread principal en temps
+// propre, appelée pour chaque groupe de la file de rendu à chaque image. Pour chaque passe du cimetière des passes
+// (std::set global 0x8356C990), puis de la liste des passes à re-hacher (0x8356C9A4) : removePassGroup (sub_821CE420)
+// dans les six collections du groupe (+8, +48, +128, +88, +168, +208), qui cherche la passe dans la map de la
+// collection (en-tête +8 ; nœud : clé +12, isnil +21 ; ordre PassGroupLess : clé de hachage +52, puis adresse,
+// sub_821CE4B8) et ne fait rien si elle n'y est pas ; puis vidage des six collections (+8, +88, +48, +128, +168,
+// +208 ; sub_821CC8E0). Ici les parcours et les recherches sont natifs ; la fonction du jeu n'est appelée que pour
+// une passe présente (retrait du vecteur et du nœud). Validation : chaque recherche comparée à sub_821CE4B8, puis
+// l'original.
+REX_EXTERN(__imp__sub_821CC998);
+REX_EXTERN(__imp__sub_821CE420);
+REX_EXTERN(__imp__sub_821CE4B8);
+
+namespace {
+
+constexpr uint32_t kPassGraveyard = 0x8356C990, kPassDirtyHash = 0x8356C9A4;
+constexpr uint32_t kGroupCollections[6] = {8, 48, 128, 88, 168, 208};
+constexpr uint32_t kGroupClearOrder[6] = {8, 88, 48, 128, 168, 208};
+
+bool PassLess(const uint8_t* base, uint32_t a, uint32_t b) {
+  const uint32_t ha = Load32(base, a + 52), hb = Load32(base, b + 52);
+  return ha != hb ? ha < hb : a < b;
+}
+
+bool CollectionHasPass(const uint8_t* base, uint32_t coll, uint32_t pass) {
+  const uint32_t head = Load32(base, coll + 8);
+  uint32_t found = head;
+  for (uint32_t n = Load32(base, head + 4); !base[n + 21];) {
+    if (PassLess(base, Load32(base, n + 12), pass)) {
+      n = Load32(base, n + 8);
+    } else {
+      found = n;
+      n = Load32(base, n);
+    }
+  }
+  return found != head && !PassLess(base, pass, Load32(base, found + 12));
+}
+
+// Passes des deux ensembles, dans l'ordre de l'original.
+template <typename F>
+void ForEachClearedPass(const uint8_t* base, F&& f) {
+  for (const uint32_t set : {kPassGraveyard, kPassDirtyHash}) {
+    const uint32_t head = Load32(base, set + 4);
+    for (uint32_t n = Load32(base, head); n != head; n = TreeNext<17>(base, n)) f(Load32(base, n + 12));
+  }
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821CC998) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821CC998(ctx, base);
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t old_sp = ctx.r1.u32, sp = old_sp - 176;
+  Store32(base, sp, old_sp);
+  ctx.r1.u64 = sp;
+  if (mode == 2) {
+    ForEachClearedPass(base, [&](uint32_t pass) {
+      for (const uint32_t off : kGroupCollections) {
+        const bool expected = CollectionHasPass(base, group + off, pass);
+        Store32(base, sp + 84, pass);
+        ctx.r3.u64 = sp + 80;
+        ctx.r4.u64 = group + off + 4;
+        ctx.r5.u64 = sp + 84;
+        __imp__sub_821CE4B8(ctx, base);
+        g_calls.fetch_add(1, std::memory_order_relaxed);
+        if ((Load32(base, sp + 80) != Load32(base, group + off + 8)) != expected) Diff();
+        static uint64_t searched = 0, present = 0;
+        searched++;
+        if (expected) present++;
+        if (searched % 200000 == 0)
+          REXLOG_INFO("[ogre natif] RenderPriorityGroup::clear : {} recherches comparées, {} passes présentes", searched,
+                      present);
+      }
+    });
+    ctx.r1.u64 = old_sp;
+    ctx.r3.u64 = group;
+    __imp__sub_821CC998(ctx, base);
+    Report();
+    return;
+  }
+  // Le cimetière n'est retiré que de l'ensemble par d'autres fonctions : les retraits ci-dessous ne touchent que les
+  // collections du groupe, l'itération reste valable.
+  ForEachClearedPass(base, [&](uint32_t pass) {
+    for (const uint32_t off : kGroupCollections) {
+      if (!CollectionHasPass(base, group + off, pass)) continue;
+      ctx.r3.u64 = group + off;
+      ctx.r4.u64 = pass;
+      __imp__sub_821CE420(ctx, base);
+    }
+  });
+  for (const uint32_t off : kGroupClearOrder) ClearQueuedCollection(base, group + off);
+  ctx.r1.u64 = old_sp;
+}
+
+// --- Material::getBestTechnique (sub_821CF100) ---
+// Console (2026-10-28, profil de combat) : 1,0 % du thread principal en temps propre (setPass, parcours de la scène,
+// géométrie statique...). r3 matériau, r4 indice de LOD (u16), r5 renderable. Techniques supportées vides (+200 =
+// +204) : 0. Schéma actif = MaterialManager (singleton 0x83506794) case 176 ; l'accesseur sub_821CF0F8 lit +288
+// (u16). Map des schémas (en-tête +220 ; nœud : clé u16 +12, map des LOD +16, isnil +21) : schéma absent -> au jeu
+// (écouteur case 196 de MaterialManager). Map des LOD (en-tête +4) : entrée de la clé, sinon (après la boucle de
+// décrément du jeu) la dernière (LOD non nul, si non nulle) ou la première ; map vide : +16 de l'en-tête.
+REX_EXTERN(__imp__sub_821CF100);
+
+namespace {
+
+constexpr uint32_t kMaterialManager = 0x83506794;
+
+uint16_t Load16(const uint8_t* base, uint32_t a) { return uint16_t(base[a] << 8 | base[a + 1]); }
+
+// Nœud de clé u16 (+12) dans une map MSVC (isnil +21), sinon l'en-tête.
+uint32_t FindU16(const uint8_t* base, uint32_t head, uint32_t key) {
+  uint32_t found = head;
+  for (uint32_t n = Load32(base, head + 4); !base[n + 21];) {
+    if (Load16(base, n + 12) < key) {
+      n = Load32(base, n + 8);
+    } else {
+      found = n;
+      n = Load32(base, n);
+    }
+  }
+  return found != head && !(key < Load16(base, found + 12)) ? found : head;
+}
+
+// Vrai si le chemin natif s'applique (sinon : fonction du jeu).
+bool BestTechnique(const uint8_t* base, uint32_t mat, uint32_t lod, uint32_t& out) {
+  if (Load32(base, mat + 200) == Load32(base, mat + 204)) {
+    out = 0;
+    return true;
+  }
+  const uint32_t mm = Load32(base, kMaterialManager);
+  if (Slot(base, mm, 176) != 0x821CF0F8) return false;
+  const uint32_t schemes = Load32(base, mat + 220);
+  const uint32_t si = FindU16(base, schemes, Load16(base, mm + 288));
+  if (si == schemes) return false;
+  const uint32_t lhead = Load32(base, Load32(base, si + 16) + 4);
+  const uint32_t li = FindU16(base, lhead, lod & 0xFFFF);
+  if (li != lhead) {
+    out = Load32(base, li + 16);
+    return true;
+  }
+  const uint32_t first = Load32(base, lhead);
+  if (first != lhead && (lod & 0xFFFF)) {
+    out = Load32(base, Load32(base, lhead + 8) + 16);
+    if (out) return true;
+  }
+  out = Load32(base, first + 16);
+  return true;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821CF100) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821CF100(ctx, base);
+  const uint32_t mat = ctx.r3.u32, lod = ctx.r4.u32;
+  uint32_t out;
+  const bool native = BestTechnique(base, mat, lod, out);
+  if (mode == 1 && native) {
+    ctx.r3.u64 = out;
+    return;
+  }
+  __imp__sub_821CF100(ctx, base);
+  if (mode != 2) return;
+  static uint64_t checked = 0, fallback = 0;
+  if (native) {
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    if (ctx.r3.u32 != out) Diff();
+  } else {
+    fallback++;
+  }
+  if (++checked % 500000 == 0)
+    REXLOG_INFO("[ogre natif] getBestTechnique : {} appels ({} laissés au jeu)", checked, fallback);
+  Report();
+}
+
+// --- Effets encore vivants d'un objet (sub_82312D98, logique du jeu, fonction feuille) ---
+// Console (2026-10-27, profil de combat) : 1,2 % du thread principal en temps propre (parcours de pointeurs). r3
+// objet (liste d'effets +244 : données +8, nombre +12, capacité +16 ; un indice hors de la capacité prend
+// l'élément 0, comme le jeu), r4 octet. Pour chaque système de ParticleUniverse de la liste, sa première technique
+// (+348) : si la somme (u32) de +432, +476, +388, +344, +304 est nulle, ou si un émetteur (+216..+220, non nul) a
+// +386 vrai, ou (octet r4 nul) +300 = -1, il ne compte pas. Rend le nombre de systèmes comptés.
+REX_EXTERN(__imp__sub_82312D98);
+
+namespace {
+
+uint32_t LiveEffects(const uint8_t* base, uint32_t obj, uint32_t flag) {
+  const uint32_t list = Load32(base, obj + 244);
+  if (!list) return 0;
+  const uint32_t count = Load32(base, list + 12), cap = Load32(base, list + 16);
+  uint32_t live = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const uint32_t data = Load32(base, list + 8);
+    const uint32_t sys = Load32(base, i < cap ? data + 4 * i : data);
+    const uint32_t tech = Load32(base, Load32(base, sys + 348));
+    if (!tech) continue;
+    if (Load32(base, tech + 432) + Load32(base, tech + 476) + Load32(base, tech + 388) + Load32(base, tech + 344) +
+            Load32(base, tech + 304) ==
+        0)
+      continue;
+    const uint32_t n = uint32_t(int32_t(Load32(base, tech + 220) - Load32(base, tech + 216)) >> 2);
+    bool stop = false;
+    for (uint32_t k = 0; n && k < n; k++) {
+      const uint32_t e = Load32(base, Load32(base, tech + 216) + 4 * k);
+      if (e && base[e + 386]) {
+        stop = true;
+        break;
+      }
+      if (!(flag & 0xFF) && e && Load32(base, e + 300) == 0xFFFFFFFFu) {
+        stop = true;
+        break;
+      }
+    }
+    if (!stop) live++;
+  }
+  return live;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_82312D98) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_82312D98(ctx, base);
+  const uint32_t obj = ctx.r3.u32, flag = ctx.r4.u32;
+  if (mode == 1) {
+    ctx.r3.u64 = LiveEffects(base, obj, flag);
+    return;
+  }
+  const uint32_t expected = LiveEffects(base, obj, flag);
+  __imp__sub_82312D98(ctx, base);
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  static uint64_t checked = 0, diffs = 0;
+  if (ctx.r3.u32 != expected) {
+    g_diffs.fetch_add(1, std::memory_order_relaxed);
+    diffs++;
+  }
+  if (++checked % 100000 == 0)
+    REXLOG_INFO("[ogre natif] effets vivants : {} appels comparés, {} différences", checked, diffs);
+  Report();
+}
+
+// --- Valeur dans le vecteur d'une clé d'une std::map (sub_821D7D38, logique du jeu, fonction feuille) ---
+// Console (2026-10-27, profil de combat) : 0,7 % du thread principal ; 135 sites d'appel. r3 this (map : en-tête
+// +12 ; nœud : gauche +0, droite +8, clé u32 +12, vecteur +16..+20, isnil +33), r4 clé, r5 valeur. Vrai si r4 = r5,
+// sinon si la clé est présente et que son vecteur contient r5. L'original écrit l'itérateur trouvé sous r1 (-16 ou
+// -12, zone libre de la pile) : sans effet pour l'appelant.
+REX_EXTERN(__imp__sub_821D7D38);
+
+namespace {
+
+bool KeyHasValue(const uint8_t* base, uint32_t self, uint32_t key, uint32_t value) {
+  if (key == value) return true;
+  const uint32_t head = Load32(base, self + 12);
+  uint32_t found = head;
+  for (uint32_t n = Load32(base, head + 4); !base[n + 33];) {
+    if (Load32(base, n + 12) < key) {
+      n = Load32(base, n + 8);
+    } else {
+      found = n;
+      n = Load32(base, n);
+    }
+  }
+  if (found == head || key < Load32(base, found + 12)) return false;
+  const uint32_t vec = found + 16;
+  for (uint32_t i = 0;; i++) {
+    const uint32_t begin = Load32(base, vec), n = uint32_t(int32_t(Load32(base, vec + 4) - begin) >> 2);
+    if (i == 0 && n == 0) return false;
+    if (i >= n) return false;
+    if (Load32(base, begin + 4 * i) == value) return true;
+  }
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_821D7D38) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_821D7D38(ctx, base);
+  const uint32_t self = ctx.r3.u32, key = ctx.r4.u32, value = ctx.r5.u32;
+  if (mode == 1) {
+    ctx.r3.u64 = KeyHasValue(base, self, key, value) ? 1 : 0;
+    return;
+  }
+  const uint32_t expected = KeyHasValue(base, self, key, value) ? 1 : 0;
+  __imp__sub_821D7D38(ctx, base);
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  static uint64_t checked = 0, found = 0, diffs = 0;
+  if (ctx.r3.u32 != expected) {
+    g_diffs.fetch_add(1, std::memory_order_relaxed);
+    diffs++;
+  }
+  if (expected) found++;
+  if (++checked % 100000 == 0)
+    REXLOG_INFO("[ogre natif] clé et valeur : {} appels comparés ({} vrais), {} différences", checked, found, diffs);
+  Report();
+}
+
+// --- Segment contre les objets d'une liste, intersection la plus proche (sub_822F92A0, logique du jeu) ---
+// Console (2026-10-27, profil de combat) : 2,35 % du thread principal avec sub_822815E8 (1,36 % en temps propre,
+// fonctions intégrées par le LTO), sous sub_821B60D8 (mise à jour des unités). r3 this, r4 début et r5 fin du
+// segment (Vector3), f1 rayon, r7 r8 r9 sorties (Vector3 ; r8 : point touché), r10 code (u32) ; sur la pile de
+// l'appelant : +84 objet touché (u32*, peut être nul), octet +95 (seulement les objets dont +342 est vrai). Deux
+// listes chaînées (this +84 puis +88, tête rangée en +0 ; nœud : objet +0, suivant +4 ; codes 200 puis 100) : pour
+// chaque objet actif (+341 et +356), sub_822815E8 ; distance du début au point touché (fsubs, fmuls, fmadds, fsqrts
+// dans l'ordre du jeu), plus proche gardée. Rend vrai si la distance a changé de sa valeur de départ (constante +624).
+// sub_822815E8 (r3 objet, mêmes r4 r5 f1, sorties r7 r8 r9) commence par un rejet : case [60] de l'objet, +341 et
+// +356, boîte du segment (sub_821BDF30) élargie de rayon * constante +124, contre la boîte de l'objet (cases [67]
+// puis [66] ; sub_823A2EC8), et n'écrit ses sorties qu'en cas de touche. Natif : le rejet pour tous les objets ; si
+// aucun ne passe (cas courant : PC en ville, 0 sur 20 000 appels), rien n'est écrit et le résultat est 0 comme dans
+// le jeu ; sinon la fonction du jeu est appelée en entier (exacte par construction, rejet compris).
+REX_EXTERN(__imp__sub_822F92A0);
+REX_EXTERN(__imp__sub_822815E8);
+
+namespace {
+
+std::map<std::array<uint32_t, 3>, uint64_t> g_segment_slots;  // validation : cibles des cases [60] [66] [67]
+
+bool SegmentMayHit(PPCContext& ctx, uint8_t* base, uint32_t obj, uint32_t p0, uint32_t p1, double radius,
+                   bool check) {
+#pragma clang fp contract(off)
+  const uint32_t s60 = Slot(base, obj, 240), s66 = Slot(base, obj, 264), s67 = Slot(base, obj, 268);
+  if (check) g_segment_slots[{s60, s66, s67}]++;
+  uint32_t active;
+  switch (s60) {  // accesseurs du jeu (relevé PC)
+    case 0x82282398: active = Load32(base, obj + 484); break;
+    case 0x822823A0: active = Load32(base, obj + 488); break;
+    case 0x822830E8: active = Load32(base, obj + 1056); break;
+    default: active = CallGuest(ctx, base, s60, obj); break;
+  }
+  if (!active) return false;
+  if (!base[obj + 341] || !base[obj + 356]) return false;
+  float mn[3], mx[3];
+  for (int i = 0; i < 3; i++) mn[i] = mx[i] = LoadFloat(base, p0 + 4 * i);
+  for (int i = 0; i < 3; i++) {
+    const float v = LoadFloat(base, p1 + 4 * i);
+    if (!(v >= mn[i])) mn[i] = v;
+    if (!(v <= mx[i])) mx[i] = v;
+  }
+  const float r = float(radius * double(LoadFloat(base, kConstants + 124)));
+  for (int i = 0; i < 3; i++) {
+    mn[i] = mn[i] - r;
+    mx[i] = r + mx[i];
+  }
+  // sub_82280380 / sub_82280360 : maximum (+44) / minimum (+32) de la boîte +384, sinon Vector3::ZERO.
+  constexpr uint32_t kZero = 0x8355A3BC;
+  uint32_t hi, lo;
+  if (s67 == 0x82280380) {
+    const uint32_t box = Load32(base, obj + 384);
+    hi = box ? box + 44 : kZero;
+  } else {
+    hi = CallGuest(ctx, base, s67, obj);
+  }
+  if (s66 == 0x82280360) {
+    const uint32_t box = Load32(base, obj + 384);
+    lo = box ? box + 32 : kZero;
+  } else {
+    lo = CallGuest(ctx, base, s66, obj);
+  }
+  if (mx[0] < LoadFloat(base, lo)) return false;
+  if (mx[2] < LoadFloat(base, lo + 8)) return false;
+  if (mn[0] > LoadFloat(base, hi)) return false;
+  if (mn[2] > LoadFloat(base, hi + 8)) return false;
+  if (mx[1] < LoadFloat(base, lo + 4)) return false;
+  return mn[1] <= LoadFloat(base, hi + 4);
+}
+
+// Faux si aucun objet n'est rejeté qu'après son test fin : le jeu ne touche alors à aucune sortie et rend 0. Vrai
+// dès qu'un objet passe le rejet : la fonction du jeu est appelée en entier.
+bool AnySegmentCandidate(PPCContext& ctx, uint8_t* base, bool check) {
+  const uint32_t self = ctx.r3.u32, p0 = ctx.r4.u32, p1 = ctx.r5.u32;
+  const double radius = ctx.f1.f64;
+  const bool only_342 = base[ctx.r1.u32 + 95] != 0;
+  for (const uint32_t list : {84u, 88u}) {
+    for (uint32_t n = Load32(base, Load32(base, self + list)); n; n = Load32(base, n + 4)) {
+      const uint32_t obj = Load32(base, n);
+      if (!base[obj + 341] || !base[obj + 356]) continue;
+      if (only_342 && !base[obj + 342]) continue;
+      if (SegmentMayHit(ctx, base, obj, p0, p1, radius, check)) return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_822F92A0) {
+  const int mode = Mode();
+  if (mode == 0) return __imp__sub_822F92A0(ctx, base);
+  const PPCContext entry = ctx;
+  const bool candidate = AnySegmentCandidate(ctx, base, mode == 2);
+  ctx = entry;
+  if (mode == 1) {
+    if (candidate) return __imp__sub_822F92A0(ctx, base);
+    ctx.r3.u64 = 0;
+    return;
+  }
+  // Validation : sans candidat, le jeu doit rendre 0.
+  __imp__sub_822F92A0(ctx, base);
+  static uint64_t checked = 0, candidates = 0, hits = 0, diffs = 0;
+  g_calls.fetch_add(1, std::memory_order_relaxed);
+  if (candidate) candidates++;
+  if (ctx.r3.u8) hits++;
+  if (!candidate && ctx.r3.u8) {
+    g_diffs.fetch_add(1, std::memory_order_relaxed);
+    diffs++;
+  }
+  if (++checked % 20000 == 0) {
+    std::string slots;
+    for (const auto& [k, v] : g_segment_slots) slots += fmt::format(" {:08X}/{:08X}/{:08X}:{}", k[0], k[1], k[2], v);
+    REXLOG_INFO("[ogre natif] segment contre les objets : {} appels comparés ({} avec candidat, {} touchés), {} "
+                "différences ; cases{}", checked, candidates, hits, diffs, slots);
+  }
+  Report();
 }

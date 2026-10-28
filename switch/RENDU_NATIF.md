@@ -1179,3 +1179,210 @@ l'émulation GPU.
   dessins, 20,96-21,40 ms (32-36 images/s) ; B 266-270 dessins, 20,61-20,83 ms (36-37) : ~-2 %, à la limite du
   bruit. Mine : A 195 dessins 17,6-17,7 ms (45 images/s) ; B sans fenêtre immobile comparable (personnage en
   mouvement, 208-293 dessins). Aucune erreur.
+- 2026-10-21 : **essai sur la console de la 1.0.3 refaite** (build des joueurs, .nro 7e0d5f10, zip febc143e, ELF
+  switch/elf/torchlight-joueurs-1.0.3-20261021-0039.elf ; profil PGO du 2026-10-20 : UpdateControllers,
+  ControllerDestination et Outside compilées sans profil ; XJE1, sans torchlight.toml, fréquences de base ;
+  switch-logs-archive/20261021-joueurs-103/). Démarrage, ville, mine, sortie normale, aucune erreur. **Mais la mine
+  est plus lente** qu'avec le premier zip de la 1.0.3 (session A du même soir, même endroit : 162 blocs testés,
+  195 dessins) : 19,0-19,2 ms (42 images/s ; « juego » 42,6-43,1) contre 17,6-17,7 ms (45 ; 45,1-45,6), ~+8 % ;
+  ville 21,4-22,4 ms (268-272 dessins) contre 21,0-21,4 (271-277). Suspects : le préchargement (second parcours des
+  ~1 100 contrôleurs avant le vrai), la perte du profil PGO sur les fonctions modifiées, une variation entre
+  sessions. Suite décidée avec l'utilisateur : nouvelle session PGO (build instrumentée) pour couvrir ces
+  fonctions, puis mesurer de nouveau ; sinon A/B par options dans un même .nro (préchargement, systèmes arrêtés).
+- 2026-10-27 : **poses des squelettes sur d'autres cœurs (d'après torchlight-rekindled, GreenSwampDweller, GPL-3.0 :
+  renderer_poses.cpp, patch OGRE 0025) : essayé, non retenu en l'état.** Leurs autres patchs OGRE du même commit
+  (0026 masque avant _notifyCurrentCamera : déjà l'ordre de notre variante Xbox, isVisible sub_821C3660 teste le
+  masque avant ; 0027 sous-arbres : sans objet avec l'OctreeSceneManager ; 0028-0030 : ordre des dessins, pas de
+  performance) et leurs particules (index et réutilisation dans leur propre moteur) ne s'appliquent pas.
+  Fait puis retiré (trop risqué pour le gain : décision de l'utilisateur ; ancienne option --torchlight_poses) : le parcours de l'octree
+  relève les objets visibles, calcule en parallèle Entity::cacheBoneMatrices (sub_821B93B0) des entités admissibles
+  (XHostThread du SDK, 2 threads + le principal ; os et points d'attache sans écouteur, objets attachés qui ne lisent
+  pas leur position, animations linéaires, liste des temps sub_8246E800 construite avant), puis rejoue
+  _notifyCurrentCamera et _updateRenderQueue dans l'ordre. Validation PC (mode 2) : ~4 300 poses, 0 différence ; menu
+  animé (captures). Appels figés __imp__sub_821B93B0 remis en sub_X (fichiers 10, 136, 206). **Mais presque rien à
+  gagner** : la logique de Runic calcule chaque unité au début de sa mise à jour (sub_821D5410 -> sub_821BB578 ->
+  Entity::_updateAnimation sub_821B9478, drapeau +465) ; en jeu, aucune entité n'arrive au rendu sans sa pose.
+  Diagnostic PC (retiré) : en ville 51 poses de la logique par image ; seules 2 entités (personnage, familier) ont
+  leurs os relus avant le rendu (~34 lectures par image, par sub_821D9008 juste après l'animation) ; l'état d'une
+  entité change après sa pose quelques fois par 10 s. Un report des poses de la logique jusqu'au rendu serait donc
+  possible (recalcul immédiat à la lecture des os ou au changement d'animation), mais les lectures directes en
+  mémoire ne se verraient pas.
+  **Profil de la console en combat** (build des joueurs du 2026-10-21 11:33 : .nro 4a290135 = switch/out-joueurs,
+  ELF switch/elf/torchlight-joueurs-1.0.3-20261021-1133.elf, .text identique ; XJE1, fréquences de base vérifiées ;
+  pilas-archive/rex_pilas-20261027-1507.txt, switch-logs du 2026-10-27 15:07 ; le relevé couvre ~15:03:30-15:08:20,
+  combats 15:05:20-15:08:10 à 21-28 images/s, 25-32 ms). Tranches 9-18 (combat), thread principal : rendu 67,6 %
+  (cibles de rendu sub_821F26B0 29 % : renderSingleObject 15,4 %, visiteur sub_821CC700 14,3 % ; recherche des
+  objets visibles 15,9 % : WalkOctree 3,8 % propre, billboards sub_821DA090 3,4 %, géométrie statique 2,4 %,
+  entités 3,3 %) ; **contrôleurs 17,5 % (boucle 8,2 % propre, ParticleSystem::_update 8,7 %)** ; logique 27,8 %
+  (plate : sub_821E6BD8 -> sub_821D8238 12,4 %, sous-fonctions de moins de 3,5 % ; animation des unités 4,9 %) ;
+  **poses (cacheBoneMatrices) 6,0 % en tout**, dont 4,5 % par la logique. Temps propre de la boucle des contrôleurs :
+  5-11 % (1-5 % dans le profil du 2026-10-20) : le travail des systèmes arrêtés y est passé de ParticleSystem::_update
+  (natif depuis le 2026-10-21), total des contrôleurs du même ordre (14-21 %).
+- 2026-10-27 : **boucle des contrôleurs en liste plate, contrôleurs dormants sautés** (src/torchlight_ogre_natif.cpp,
+  --torchlight_controleurs : 1 par défaut, 0 = parcours du std::set comme le premier zip de la 1.0.3). Mesure PC en
+  jeu : ~1 730 contrôleurs par image, dont ~1 320 de systèmes de ParticleUniverse arrêtés (état +284 = 2 ou 3) au
+  compteur +280 déjà à 900, avec source FrameTimeControllerValue et fonction getAdjustedInput sans mDeltaInput :
+  leur mise à jour ne fait rien, mais la boucle lisait 7-8 lignes de cache pour chacun. Liste plate dans l'ordre du
+  set (adresses croissantes) : dormant sauté après lecture de la ligne du contrôleur (+52 actif, +24 destination
+  inchangée) et de celle du système (+280/+284). Liste tenue à jour par createController (sub_824B4C78, rend le
+  contrôleur : insertion) et ~Controller (sub_824B5A10 : retrait), faits sur le thread de la boucle hors de celle-ci ;
+  sinon (pendant la boucle, autre thread) refaite à l'image suivante, ou si la taille du set (+12) diffère. Appels
+  figés __imp__ remis en sub_X (createController : 9 fichiers ; ~Controller : 216).
+  **Piège (plantage sur la console en combat, première version)** : la mise à jour d'un système peut créer ou
+  détruire d'autres contrôleurs (effet terminé) ; le jeu, qui avance dans le set, ne les visite pas, la liste les
+  gardait (lecture de mémoire libérée). Correctif : drapeau testé en tête de chaque tour ; s'il est levé, suite dans
+  le set à partir du premier contrôleur d'adresse supérieure à la dernière entrée traitée (UpperBound, comparaison
+  d'adresses), comme l'itérateur du jeu. Validation PC (mode 2) : liste comparée au set à chaque image, UpperBound
+  vérifié pour chaque contrôleur, dormants vérifiés sans effet, reprise forcée à chaque image (essai) : 0 différence.
+  **A/B sur la console** (XJE1, fréquences de base vérifiées dans chaque session, mêmes endroits immobiles ; boucle
+  des contrôleurs = ligne « [contrôleurs] » du journal, particules actives comprises) :
+  - variante 0 (premier zip, sans préchargement) : ville 1,76-1,98 ms, image 19,2-19,4 ms ; mine (1 355 contrôleurs)
+    2,69-2,78 ms, image 15,1-15,3 ms ;
+  - variante « 1.0.3 refaite » (préchargement par vagues) : ville 2,12-2,17 ms, image 19,2 ms (41 images/s) ; mine
+    (1 448) 4,02-4,10 ms, image 16,3 ms (48) : **le préchargement ralentissait** (cause probable de la lenteur de la
+    1.0.3 refaite dans la mine, 2026-10-21) ;
+  - liste plate : ville 1,20-1,26 ms, image 18,1-18,4 ms (42) ; mine (1 445) 2,04-2,05 ms, image 14,7-14,8 ms (50-51) ;
+  - liste plate + préchargement des seuls systèmes actifs : ville 1,37-1,44 ms ; mine 2,50-2,58 ms : plus lent,
+    retiré avec l'autre préchargement.
+  En combat (non comparable d'une session à l'autre) : 1 600-2 000 contrôleurs, boucle 6-9 ms, 19-24 images/s ;
+  liste refaite 2-5 fois par 10 s (contrôleurs changés pendant la boucle), 23 reprises dans le set sans incident.
+  Journaux : switch-logs-archive/20261027-ab-controleurs-{0,1,2,2b,3}/ ; builds d'essai dist/torchlight-essai-
+  controleurs*.nro et ELF switch/elf/torchlight-essai-controleurs-*.elf. Suite : profil de combat (pilas-on) avec
+  cette boucle, pour choisir entre particules actives, dessin et recherche des objets visibles.
+- 2026-10-27 : **deux fonctions de la logique en natif** (src/torchlight_ogre_natif.cpp, validation PC en mode 2 :
+  0 différence). (1) sub_821A1510, recherche d'un élément par nom (std::wstring) dans un conteneur : nom = valeur de
+  l'identifiant de l'élément dans la std::map de son objet (sub_821A1608, sub_821A1670), comparaison sub_821A1478 ;
+  570 appels figés remis en sub_X (~90 fichiers). PC : 189 000 appels comparés. (2) sub_822F92A0, segment contre les
+  objets de deux listes (intersection la plus proche) : le rejet de sub_822815E8 (case [60] : accesseurs +484, +488,
+  +1056 ; boîte du segment élargie du rayon contre la boîte +384, minimum +32, maximum +44, sinon Vector3::ZERO) est
+  natif pour tous les objets ; si aucun ne passe, rien n'est écrit et le résultat est 0 comme dans le jeu, sinon la
+  fonction du jeu est appelée en entier (PC en ville : 27 appels sur 20 000). Appels figés de sub_822F92A0 remis en
+  sub_X (fichiers 6 et 64).
+  Console (dist/torchlight-essai-natives-logique.nro 8ced7bbf, ELF switch/elf/torchlight-essai-natives-logique-
+  20261027-2030.elf ; pilas-archive/rex_pilas-20261027-2102.txt, switch-logs-archive/20261027-profil-natives-logique/ ;
+  fréquences de base ; combats ~2 min, 3 793 échantillons) : sub_821A1510 1,90 -> 1,24 % du thread principal en combat
+  (13,5 -> 9,2 % de sub_821D3FD8) ; sub_822F92A0 avec sub_822815E8 2,35 -> 1,24 % (16,7 -> 9,2 %). Environ 1,8 % du
+  thread principal en combat. Reste : parcours natif de la recherche par nom 1,2 % (attentes de la mémoire : élément,
+  objet, arbre, chaîne), rejet natif 0,66 %, calcul fin du jeu 0,53 %.
+- 2026-10-27 (soir) : **analyse du dessin et du multi-cœur, préparation de la session PGO.** Dessin en combat (profil
+  rex_pilas-20261027-2102) : cibles de rendu 29 % du thread principal, aucune fonction du jeu au-dessus de 2 % en
+  propre (renderSingleObject 2,0 %, paramètres des programmes sub_821C26D0 4,2 % inclusif dont _updateAutoParams
+  natif 1,8 %, écouteur du RT Shader System 2,4 %, setPass 1,3 %, interface sub_821AFEA0 3,6 %, overlays
+  sub_821D2F80 2,5 %) ; notre code 4,8 % (natif::Render 2,7 % propre, ~2,7 µs par dessin : attentes de la mémoire
+  sur VertexData, déclaration, liaisons, tampons). Multi-cœur : logique ~31 % et rendu ~64 % du thread principal en
+  combat ; aucun bloc isolé assez gros pour 20 -> 30 images/s ; recouvrir logique et rendu demanderait une copie
+  figée de la scène (mémoire du jeu partagée) : hors de portée ; particules de ParticleUniverse en parallèle
+  (~10 %) possibles seulement avec des tirages aléatoires dans un autre ordre (générateur global) : décision de
+  l'utilisateur attendue. Build instrumentée pour une nouvelle session PGO (combats compris) :
+  dist/torchlight-pgo-instrumente-4.nro (bbff7c56), envoyée sur la console ; ancien profil gardé dans pgo-20261021/.
+- 2026-10-28 : **nouveau profil PGO (session 4, combats compris) et build des joueurs.** Session de l'utilisateur
+  (~11 min 30, fréquences de base ; switch-logs-archive/20261028-session-pgo-4/) : 3 vidages seulement (toutes les
+  3 min ; les ~2 min 30 après le dernier, dont le combat le plus lourd, perdues à la fermeture par HOME). **Piège :
+  ninja ne suit pas les .gcda** : la première build des joueurs ne refaisait que l'édition des liens avec les objets
+  de la veille (ancien profil). build_joueurs.sh supprime maintenant les objets plus anciens que le dernier .gcda de
+  pgo/. Build : switch/out-joueurs, .nro 9b76b23c (copie dist/torchlight-essai-pgo4.nro), zip
+  dist/torchlight-nx-1.0.3.zip c608ea1c, ELF switch/elf/torchlight-joueurs-1.0.3-20261028-1217.elf ; zip précédent
+  (9fce6dce, 2026-10-21 11:33) gardé dans dist/torchlight-nx-1.0.3-20261021-1133.zip. Console XJE1 sans
+  torchlight.toml (switch-logs-archive/20261028-joueurs-pgo4/) contre la liste plate d'hier (20261027-ab-controleurs-2,
+  ancien profil), mêmes endroits : ville 242 dessins 18,4-18,7 ms contre 18,3-18,6 (égal) ; mine 143-144 dessins
+  14,3-14,5 ms (51-52 images/s) contre 14,8-14,9 (~-3 %) ; combat 17-25 images/s. Aucune erreur. Publication remise
+  après l'analyse des particules (décision de l'utilisateur).
+- 2026-10-28 : **particules de ParticleUniverse sur d'autres cœurs : analyse de l'état partagé.** L'utilisateur accepte
+  des particules non identiques à l'octet tant qu'elles sont visuellement équivalentes. Version de ParticleUniverse du
+  jeu (RTTI) : émetteurs, affecteurs, externs, renderers ; ni observateurs, ni gestionnaires d'événements, ni
+  émetteurs émis. rand du CRT (sub_821BDDA8) : graine dans les données par thread (_getptd sub_821BDD68, +20) : pas de
+  course, chaque thread a sa suite. Outil : switch/tools/suivi_memoire/ (preparer.py : copie du code généré dont le
+  pch suit chaque lecture et écriture quand t_suivi_actif est posé, REX_RAW_ADDR classés d'après l'instruction ;
+  _update sub_821C8618 encadré dans sub_821C8A58 ; blocs oubliés à chaque allocation sub_821CD7F8 ; écritures de la
+  même valeur à part ; build PC à part, lancée avec --torchlight_ogre_natif=0 --torchlight_crt_natif=false). Pour
+  chaque image, tout mot de 4 octets lu ou écrit par un système après l'écriture d'un autre (ou écrit après la
+  lecture d'un autre) est noté. Session PC dans la mine avec combats (manette de script) : 11 069 images, 137 systèmes
+  mis à jour par image ; résultat switch-logs-archive/20261028-suivi-particules/. Familles :
+  (1) bénignes : compteurs de statistiques du ParticleSystemManager (singleton 0x83506798 ; +192..+208, seulement
+  incrémentés dans tout le code) ; allocateur (verrou récursif sub_8241F8F8, tas par thread : sub_8241F6F8,
+  sub_8241F820) ; rand et données par thread (r13) ; réécritures de la même valeur par Camera::isViewOutOfDate
+  (sub_821C47F0) ;
+  (2) caméra : ParticleSystem::_notifyCurrentCamera (sub_821C3A88, case 0xd4, appelé par _update ; sort tout de suite
+  si la caméra est la même que +484) recalcule la caméra (Frustum sub_8219FDC0, isViewOutOfDate) et, par
+  sub_821BA2A0 -> sub_821A1CA8, le code de Runic attaché à la caméra (+600) qui écrit des globales (0x834A4B18..
+  0x834A5F4C : tampon mis à zéro, liste) : ~4 % des images, plus les recalculs du frustum ~5-9 % ;
+  (3) Node::requestUpdate (sub_821CCDD0, case 0x100) : insertion dans le std::set des enfants à mettre à jour d'un
+  parent partagé (arbre sub_823ECF88, sub_823ECDE8, rotations sub_8246CB00, sub_82447398) : toutes les images ;
+  (4) réserve de particules du gestionnaire (sub_8258F8F8 : vecteur +228 du ParticleSystemManager, appelé par
+  sub_821BF568 depuis la mise à jour des techniques) : ~4 % des images.
+  Processeur en combat sur la console : ~150 % sur 300 (principal 99 %, rendu ~30 %) : un cœur et demi libre.
+  Plan possible : groupe de threads du jeu (XHostThread, comme l'essai des poses) pour les systèmes actifs de la boucle
+  des contrôleurs ; avant, sur le thread principal, caméra de chaque système notifiée (2) ; sur les threads de
+  travail, requestUpdate mis de côté puis rejoué dans l'ordre (3), réserve sous verrou (4) ; vérification par le même
+  suivi (accès croisés restants = familles bénignes). Gain estimé : ~10 % du thread principal en combat, au mieux
+  ~5 % gagnés (~1 image/s à 20).
+- 2026-10-28 : **particules en parallèle, première version** (src/torchlight_particules.{h,cpp},
+  --torchlight_particules : 0 = comme le jeu (défaut pour l'instant), 1 = mises de côté puis en série sur le thread
+  principal (validation), 2 = en parallèle ; --torchlight_particules_threads = 2). La boucle native des contrôleurs
+  met de côté les systèmes actifs admis (ControllerDestination -> Prendre) et Executer les met à jour à la fin de la
+  boucle (thread principal + XHostThread du SDK, pile de 256 Ko). Admis : état +284 = 1, renderers billboards
+  (vtable 0x82001BBC), techniques préparées (sub_821DD4F8 sans travail : +680/+681/+682 nuls, renderer +66,
+  +189..+192), pas de fin de durée (+436, +384 + +476 x dt contre +432). En série (verrou récursif commun, classe
+  Serie) : _notifyCurrentCamera sub_821C3A88 (caméra, tri à base fixe aux tampons statiques), réserve du gestionnaire
+  sub_8258F8F8 et sub_825A4C68, BillboardSet::setPoolSize sub_8247A588 (destruction des tampons du Direct3D du jeu),
+  createController et ~Controller ; différé puis rejoué dans l'ordre : Node::requestUpdate sub_821CCDD0 ; avant les
+  tâches : frustum de chaque caméra (+484) mis à jour par son test de visibilité (case 372) sur une sphère nulle.
+  Appels figés remis en sub_X dans le code généré (non versionné) : sub_821C3A88 (fichier 161), sub_821CCDD0 (119),
+  sub_8258F8F8 (103), sub_825A4C68 (74, 94), sub_8247A588 (64).
+  **Piège** : un thread de travail démarre avec r1 au sommet de sa pile ; setValue écrit dans le cadre de son appelant
+  (r1+156 après stwu -128) : page de garde, boucle d'erreurs « Unhandled guest access violation ». Cadre de 512
+  octets réservé au démarrage du thread.
+  Validation PC (switch/tools/suivi_memoire, TORCHLIGHT_SUIVI_TACHES=1, mode 1 : seules les tâches sont suivies,
+  accès en série marqués) : mine avec combats de script, ~12 000 images, ~210 systèmes admis par image (refusés :
+  ~1 rendu, ~1 préparation, ~0,4 fin) : plus aucun accès croisé hors des familles bénignes (statistiques, allocateur
+  du jeu : artefact du mode 1 où toutes les tâches partagent le tas du thread principal). Mode 2 sur PC : 5 min sans
+  erreur, images normales (le script ne provoque pas de vrai combat). Profil de la console du 2026-10-27 : dans
+  _update, notification de caméra ~17 %, requestUpdate ~14 % (restent en série) : ~69 % parallèle, gain attendu
+  4-5 % en combat. Essai : dist/torchlight-essai-particules-paralleles.nro (73fae506 ; LTO + PGO du 2026-10-28 ; ELF
+  switch/elf/torchlight-essai-particules-paralleles-*.elf), A/B sur la console à faire avec torchlight.toml
+  « torchlight_particules = 2 » puis sans.
+- 2026-10-28 (après-midi) : **A/B des particules en parallèle sur la console, puis natives et consolidation.**
+  A/B (dist/torchlight-essai-particules-paralleles.nro 73fae506, même .nro ; B : torchlight.toml
+  « torchlight_particules = 2 », A : sans ; switch-logs-archive/20261028-ab-particules-{A,B}/ ; fréquences de base) :
+  ville 242 dessins A 18,3-18,4 ms / B 18,4-18,6 (contrôleurs 1,22-1,26 / 1,19-1,23) ; mine A 138-139 dessins 14,1-14,2
+  / B 136-137 13,6-13,8 (contrôleurs 1,83-1,89 / 1,86-1,92 : sans effet au repos) ; combat A 318-381 dessins 31-37 ms,
+  contrôleurs 6,8-8,7 / B 272-347 dessins 25-31 ms, contrôleurs 3,7-5,0 : ~2,5-3,5 ms gagnés par image (~8-10 %).
+  Effets visuellement normaux (utilisateur). torchlight_particules = 2 par défaut.
+  Profil de combat avec le parallèle (dist/torchlight-essai-natives-2.nro 9b5e6db0 ; pilas-archive/rex_pilas-20261028-
+  1520.txt, switch-logs-archive/20261028-profil-natives-2/) : contrôleurs 8,6 % du thread principal (13,6 % avant),
+  mais attente du verrou commun ~1 % (rmutexLock sous _update) : toute la notification de caméra était en série. Le
+  verrou ne couvre plus que le tri des particules (sub_821A1CA8) ; validation par le suivi : aucun accès croisé hors
+  réécritures de la même valeur (cache de vue de la caméra, déjà à jour). Critère de préparation : techniques
+  désactivées (+92 nul) et sautées (+136) ignorées (console : jusqu'à ~45 systèmes refusés par image à cause d'elles).
+  Natives (src/torchlight_ogre_natif.cpp, validées au bit près sur PC, mode 2, nouveau script de manette qui fait
+  parcourir la mine) : sub_821D7D38 (clé et valeur d'une std::map, 4,2 M appels), sub_82312D98 (effets vivants d'un
+  objet, 0,87 M), RenderPriorityGroup::clear sub_821CC998 (parcours des passes du cimetière et à re-hacher, recherches
+  natives ; 1,8 M recherches, 3 688 passes présentes), Material::getBestTechnique sub_821CF100 (schéma absent laissé
+  au jeu ; 4 M appels, 321 au jeu). Appels figés remis en sub_X : 821D7D38 (135 sites, 69 fichiers), 82312D98 (3),
+  821CC998 (193), 821CF100 (24 sites), 821A1CA8 (145) ; sub_821C3A88 refigé (161). Reste du profil : plat (rendu
+  d'Ogre : renderSingleObject 2,2 %, setPass 1,4 %, paramètres 0,9 % ; logique : grosses fonctions < 1 %).
+  Build consolidée (dist/torchlight-essai-consolidee.nro 972a1319, ancien profil PGO ; switch-logs-archive/
+  20261028-consolidee/) : ville 242 dessins 18,15-18,35 ms (contrôleurs 1,04-1,09) ; mine 143-144 dessins 14,2-14,55
+  (contrôleurs 1,81-1,87) ; combat ~380 dessins 33,0-34,4 ms (contrôleurs 4,6-5,4) contre 37,2 (8,7) en A. Aucune
+  erreur. Blocage : le thread principal (99 % d'un cœur en combat, attente du rendu 0,2-0,8 ms) ; le GPU (307 MHz)
+  n'est pas le facteur limitant.
+- 2026-10-28 (soir) : **session PGO 5, tri des tâches, mode boost des chargements, étude des billboards.**
+  Session PGO (dist/torchlight-pgo-instrumente-5.nro 3ee068f3 ; 6 vidages, ~18 min sur 21,5 ; profil précédent
+  gardé dans pgo-20261028/ ; switch-logs-archive/20261028-session-pgo-5/ ; CPU à 1224 MHz ~3 min, sans effet sur les
+  comptes) : refus de préparation des particules tombés à 0 dans les scènes stables.
+  Test des fréquences par l'utilisateur (même build ; switch-logs-archive/20261028-frequences/) : GPU à 460 MHz sans
+  effet (ville 242 dessins 18,3-18,4 ms comme à 307 MHz) ; CPU à 1224 MHz : ville 16,25-16,3 ms (47 images/s), mine
+  12,4 ms (58), combat 26,6-29,4 ms : le jeu est limité par le thread principal, pas par le GPU.
+  Tri des tâches de particules (mode 2) : les plus coûteuses d'abord (particules actives des techniques +304, plus un
+  coût fixe) pour moins attendre la dernière (Executer : 4,8 % du thread principal en combat, sa part comprise).
+  Mode boost pendant les chargements (src/torchlight_boost.{h,cpp}, --torchlight_boost_chargement, vrai par défaut) :
+  thread de surveillance ; appletSetCpuBoostMode(FastLoad) quand aucune image n'est finie depuis 250 ms (signal :
+  EndGameFrame du rendu natif), retiré après 0,5 s d'images régulières ou hors du premier plan ; durée de chaque
+  chargement dans le journal (« [boost] »). À vérifier sur la console.
+  Étude (non faite, décision de l'utilisateur : publier d'abord) : sommets des billboards en parallèle. Mise à jour des
+  billboards (BillboardRenderer::_updateRenderQueue sub_821DA090, appelée pendant le parcours de l'octree) : 3,96 % du
+  thread principal en combat (sommets ~1 %, boucle ~1 %, préparation ~0,6 %, verrouillage ~0,5 % sous section
+  critique du Direct3D du jeu, mise en file ~0,5 %). Piste : appels mis de côté pendant le parcours (natif), faits en
+  parallèle à la fin de ce même parcours, addRenderable notés puis rejoués dans l'ordre (ordre de la file changé :
+  seulement entre transparents de même profondeur), requestUpdate différés, création de BillboardSet en série ;
+  validation par le suivi mémoire ; gain attendu ~1,5-2 % en combat.

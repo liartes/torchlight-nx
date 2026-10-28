@@ -85,6 +85,9 @@ An optional `torchlight.toml` placed next to `torchlight.nro` overrides the buil
 ones in [`switch/torchlight.toml`](switch/torchlight.toml), which explains each of them. You don't need it to play.
 
 The port targets the stock clocks. Overclocking (for example with sys-clk) is your choice and is not required.
+If you do overclock, raise the **CPU**: the game is limited by its main thread, and a faster GPU makes no
+difference. During loading screens the port already asks the system for its official CPU boost mode, the one the
+console's own games use for loading, and goes back to normal clocks as soon as the game is running again.
 
 ## Known issues
 
@@ -153,6 +156,9 @@ This port would not exist without the work of these projects and their developer
   registers kept in locals).
 - [torchlight-recomp](https://github.com/YaPeL/torchlight-recomp) by YaPeL: the PC port of the same game, whose
   analysis showed which off-screen scenery to skip and which of the game's Xbox Direct3D work can be left out.
+- [torchlight-rekindled](https://github.com/GreenSwampDweller/torchlight-rekindled) by GreenSwampDweller: its way
+  of handing part of Ogre's per-object work to worker threads is what led this port to update the particle effects
+  on several cores.
 
 **Switch homebrew**
 
