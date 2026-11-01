@@ -14,7 +14,7 @@ project(torchlight LANGUAGES CXX)
 
 # Nom public du projet : torchlight-nx (portage non officiel ; menu homebrew, zip des joueurs). Version affichée par
 # le menu homebrew et nom du zip (switch/build_joueurs.sh).
-set(TORCHLIGHT_VERSION "1.0.3")
+set(TORCHLIGHT_VERSION "1.0.4")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,6 +76,18 @@ endif()
 option(TORCHLIGHT_PILE_NON_VOLATILE "Accès à la pile du code généré sans volatile" ON)
 if(TORCHLIGHT_PILE_NON_VOLATILE AND TARGET torchlight_recomp)
     target_compile_definitions(torchlight_recomp PRIVATE REX_STACK_NON_VOLATILE=1)
+endif()
+# Toute la mémoire du jeu sans volatile, avec des barrières du compilateur aux têtes de boucle et aux sync du jeu
+# (switch/tools/memoire_non_volatile.py, d'après renut-nx). OFF : macros volatile et barrières vides (code d'origine).
+option(TORCHLIGHT_MEMOIRE_NON_VOLATILE "Mémoire du jeu sans volatile dans le code généré" OFF)
+if(TORCHLIGHT_MEMOIRE_NON_VOLATILE AND TARGET torchlight_recomp)
+    target_compile_definitions(torchlight_recomp PRIVATE REX_GUEST_MEMORY_NON_VOLATILE=1)
+endif()
+# Adresse de retour écrite dans ctx.lr avant chaque appel (switch/tools/retour_sans_lr.py) : OFF, rien n'est écrit
+# (personne ne la lit pour revenir) ; ON, le code d'origine.
+option(TORCHLIGHT_RETOUR_LR "Écrire l'adresse de retour dans ctx.lr avant chaque appel" OFF)
+if(TORCHLIGHT_RETOUR_LR AND TARGET torchlight_recomp)
+    target_compile_definitions(torchlight_recomp PRIVATE REX_LR_STORES=1)
 endif()
 
 if(REXGLUE_PLATFORM_SWITCH)

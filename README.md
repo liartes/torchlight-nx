@@ -154,6 +154,9 @@ This port would not exist without the work of these projects and their developer
 - [sa2-nx](https://github.com/ChanseyIsTheBest/sa2-nx) by ChanseyIsTheBest: the build-time rewrites of the
   recompiled code that make the game run faster (indirect calls, read-only constants, floating-point loads,
   registers kept in locals).
+- [renut-nx](https://github.com/ChanseyIsTheBest/renut-nx) by ChanseyIsTheBest: its documented code generator
+  improvements (return addresses, scratch registers kept in locals, simpler bit rotations) and the audit tool that
+  makes the scratch registers safe.
 - [torchlight-recomp](https://github.com/YaPeL/torchlight-recomp) by YaPeL: the PC port of the same game, whose
   analysis showed which off-screen scenery to skip and which of the game's Xbox Direct3D work can be left out.
 - [torchlight-rekindled](https://github.com/GreenSwampDweller/torchlight-rekindled) by GreenSwampDweller: its way

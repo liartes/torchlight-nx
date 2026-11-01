@@ -1386,3 +1386,142 @@ l'émulation GPU.
   parallèle à la fin de ce même parcours, addRenderable notés puis rejoués dans l'ordre (ordre de la file changé :
   seulement entre transparents de même profondeur), requestUpdate différés, création de BillboardSet en série ;
   validation par le suivi mémoire ; gain attendu ~1,5-2 % en combat.
+- 2026-10-28 (fin) : **1.0.3 publiée.** Build des joueurs (profil PGO de la session 5, tri des tâches, mode boost) :
+  .nro 3e94a750 (dist/torchlight-joueurs-1.0.3-20261028-2037.nro, ELF switch/elf/torchlight-joueurs-1.0.3-20261028-
+  2037.elf). Console XJE1 sans torchlight.toml (switch-logs-archive/20261028-joueurs-final/) : ville 242 dessins
+  18,25-18,4 ms ; mine 153 dessins 14,15 ms ; combat 368 dessins 32,2 ms ; 24 passages en mode boost (0,5-6,7 s, en
+  groupes par chargement : lancement de la partie ~26 s, ville ~15 s, mine ~20 s), aucun en combat ; le profileur
+  l'a vu (CPU 2397 MHz, GPU 76,8 MHz). Chargements plus courts d'après l'utilisateur. Aucune erreur.
+  Zip refait à la main avec ce .nro et les README/THIRD_PARTY_NOTICES à jour (crédit torchlight-rekindled, conseil :
+  monter le CPU plutôt que le GPU) : dist/torchlight-nx-1.0.3.zip 259af13c (build_joueurs.sh refait l'édition des
+  liens, donc un autre .nro : à ne pas utiliser pour un simple changement de documents). main 25ccc79,
+  torchlight-nx 6624ad2 poussé ; texte dist/RELEASE-1.0.3.md ; release à créer par l'utilisateur.
+- 2026-11-01 : **documentation de renut-nx** (https://github.com/ChanseyIsTheBest/renut-nx, docs/, GPL-3.0 ; portage
+  de Banjo-Kazooie N&B, outils repris de sa2-nx, masseffect-nx, futari-nx, marathon-nx). Comparée à notre chaîne :
+  pistes retenues, par ordre : (1) toute la mémoire du jeu sans volatile + barrières en tête de boucle
+  (pch_no_volatile.py + loop_barriers.py ; masseffect-nx : +15-20 % d'images/s sur la console) ; (2) plus
+  d'écriture ctx.lr = <retour> avant chaque appel (elide_lr_stores ; 406 020 sites chez nous ; mflr lit toujours
+  ctx.lr, contrairement à skip_lr) ; (3) non_argument_as_local refaite : leur première version oubliait de passer
+  r11/r12... aux branchements conditionnels de fin de fonction (if (crN) { sub_X(ctx, base); return; }), et il faut
+  une liste de fonctions gardées (tools/non_argument_audit.py) : explication probable de notre blocage du
+  2026-10-02 (sections critiques jamais relâchées). Plus petits : mode 4 cœurs (docs/four-core-mode.md, NPDM du
+  forwarder Sphaira écrit par le .nro), changements de mode flottant (24 661 sites disableFlushMode chez nous),
+  rlwinm en décalages simples (-0,5 %), sections critiques en ligne. Leur rendu (deko3d) ne nous concerne pas.
+- 2026-11-01 : **mémoire du jeu sans volatile** (switch/tools/memoire_non_volatile.py, lancé en dernier par
+  build_switch.sh ; option CMake TORCHLIGHT_MEMOIRE_NON_VOLATILE, ON ; OFF = macros volatile et barrières vides,
+  donc le code de la 1.0.3). Les huit REX_LOAD_U*/REX_STORE_U* passent par des types rex_mem_uN (may_alias,
+  aligned(1)) ; REX_MM_* restent volatile. REX_LOOP_BARRIER() (asm "+m" sur la fenêtre de 4 Go seulement : ctx, pile
+  de l'hôte et variables des registres locaux gardent leurs registres) après 28 606 des 33 773 têtes de boucle (les
+  autres ne lisent pas la mémoire du jeu et n'appellent rien, ou chaque retour passe par un appel indirect) ;
+  REX_SYNC_BARRIER() après les 75 sync / lwsync / eieio (le générateur n'en écrit rien ; le compilateur ne
+  réordonne plus à travers, comme avec volatile). Sauvegarde du code généré d'avant :
+  switch/out-pc/generated-avant-memoire-20261101.tar.zst. Contrôle de l'ELF : switch/tools/boucles_infinies.py
+  (d'après find_self_loops.py) : 0 saut sur lui-même dans une fonction recompilée (1.0.3 : 2, sub_82418168 et
+  sub_826A5BB8, des b . voulus). Build Switch LTO + PGO (ancien profil, appliqué en grande partie) sans outils,
+  switch/out-memoire : .text 58,54 -> 57,18 Mo (-2,3 %). PC (clang) : session scriptée de 200 s (sauvegarde de la
+  console, ville, déplacements, attaques, dialogue), natives en validation (mode 2) : 0 différence partout, images
+  justes. Essai : dist/torchlight-essai-memoire.nro (d044c6e9, ELF switch/elf/torchlight-essai-memoire-20261101-
+  0808.elf). Reste : A/B sur la console aux fréquences de base contre la 1.0.3 (ville, mine, combat), puis
+  nouvelle session PGO si gardé.
+- 2026-11-01 : **essai « mémoire sans volatile » sur la console XJE1** (fréquences de base vérifiées ; journaux
+  switch-logs-archive/20261101-essai-memoire/, première session ignorée : réglage des fréquences par l'utilisateur ;
+  ceux de la 1.0.3 d'avant : 20261101-avant-essai-memoire/). Aucun gel ni erreur. Ville, même endroit, 242 dessins :
+  18,62-18,72 ms contre 18,25-18,38 avec la 1.0.3 (20261028-joueurs-final) : pas de gain, ~2 % plus lent. Mine
+  (181 dessins contre 153) et combat (~285 contre 368) à d'autres endroits : non comparables. Profil PGO bien
+  appliqué au code généré (torchlight_recomp.50 recompilé avec -Wmissing-profile -Wcoverage-mismatch : aucun
+  avertissement). ctx est déjà __restrict dans notre SDK, pas de -mstrict-align. Le gain de masseffect-nx ne se
+  retrouve pas ici.
+- 2026-11-01 : mémoire sans volatile **désactivée** (TORCHLIGHT_MEMOIRE_NON_VOLATILE OFF par défaut, étape retirée
+  de build_switch.sh, outil gardé ; code généré revenu à l'identique de la sauvegarde, vérifié par diff).
+- 2026-11-01 : **adresse de retour non écrite dans ctx.lr** (switch/tools/retour_sans_lr.py, d'après elide_lr_stores
+  de renut-nx ; lancé par build_switch.sh après pile_non_volatile.py ; option CMake TORCHLIGHT_RETOUR_LR, OFF = rien
+  écrit, ON = code d'origine). 406 020 « ctx.lr = 0x...; » deviennent REX_LR(0x...). Audit : 34 757 mflr, presque
+  tous de prologue (rangés sur la pile puis remis par mtlr) ; hors prologue, fonctions de la bibliothèque C du jeu
+  0x8287C430/C570/C61C/C640 (mflr puis mtlr ; le blrl de funclet garde sa cible, écrite par un mtlr) et setjmp /
+  longjmp ; RtlUnwind / RtlVirtualUnwind sont des bouchons du SDK (pas de déroulement de la pile du jeu) ; le runtime
+  ne lit ctx.lr que pour des journaux et la sauvegarde d'état des threads. appels_indirects.py accepte désormais
+  « REX_LR( » comme ligne avant un bctrl (381 sites promus retrouvés, 0 changement). Build Switch LTO + PGO (profil
+  de la 1.0.3, structure des fonctions inchangée) sans outils, switch/out-memoire : .text 58,54 -> 54,92 Mo
+  (-6,2 %) ; mêmes 2 sauts sur eux-mêmes que la 1.0.3. PC : même session scriptée, 0 différence partout, images
+  justes. Essai : dist/torchlight-essai-lr.nro (fbceeee7, ELF switch/elf/torchlight-essai-lr-20261101-0850.elf).
+- 2026-11-01 : **essai « ctx.lr non écrit » sur la console XJE1** (fréquences de base vérifiées ; journaux
+  switch-logs-archive/20261101-essai-lr/). Aucune erreur. Ville, même endroit, 242 dessins : 17,85-18,03 ms contre
+  18,25-18,38 (1.0.3) et 18,62-18,72 (essai mémoire sans volatile) : ~-2 % contre la 1.0.3. Mine, même endroit que
+  l'essai mémoire (181-183 dessins) : 14,81-14,90 contre 15,29-15,42 (-3 % ; pas de mesure 1.0.3 à cet endroit).
+  Combat (280-320 dessins) : 24-26,5 ms, comme la 1.0.3 et l'essai mémoire à nombre de dessins égal (bruit trop
+  fort pour conclure). Gardé.
+- 2026-11-01 : **non_argument_as_local refaite** (r0, r2, r11, r12, f0, v32-v63 en variables locales ; d'après
+  renut-nx / sa2-nx). Cause probable du blocage du 2026-10-02 : notre SDK n'avait que l'option de base, sans liste
+  de fonctions gardées ni passage des registres : un appelant qui met r12 en variable ne le passe pas à une fonction
+  qui le lit à l'entrée (funclets : r31 = r12 - N). Générateur du SDK modifié (switch/patches/nfsmw-sdk.patch :
+  config.h/.cpp non_argument_as_local_keep ; builders/context.cpp localizeNonArguments, keepsNonArgumentsInCtx,
+  emit_call_handing_non_arguments aux appels directs, aux branchements conditionnels de fin et aux tables de saut
+  (control_flow.cpp) ; emit_call_sharing_registers élargi à r0-r13/f0-f13/v0-v63 ; rexglue recompilé, en-tête
+  précompilé de nfsmw-nx/out/host périmé supprimé). Audit : switch/tools/audit_non_arguments.py (copie de
+  non_argument_audit.py de renut-nx) sur un code généré SANS l'option dans le bloc-notes : ENTRY 308 (helpers
+  __save/__rest et 90 fonctions : funclets r12, sub_82623220/34 r11), RET 409 dont presque tout derrière des
+  fonctions sans retour (lancement d'exception sub_8285ADE0/AE18 -> sub_82865D90, DbgBreakPoint sub_8287D560,
+  rapporteur d'erreur sub_828B5820, longjmp sub_828636E0 : --noreturn) ; restent 3 subfe sans effet et un vrai
+  retour dans r11 (sub_828756C8, lu par sub_82875600). Appels indirects qui passent r12 : _CallSettingFrame
+  sub_8287C430 (r12 = r4) et sub_828609A4 (r12 = r5). Liste switch/non_arguments_gardes.txt (93), écrite par
+  gen_manifest.sh dans non_argument_as_local_keep (option ajoutée aux options par défaut). Code généré avec
+  l'option, audit --with-option : HANDOVER 0, RET 2 (subfe), ENTRY = les fonctions gardées. Régénération du vrai
+  code puis toute la chaîne (constantes 6974 repliées, 381 appels promus retrouvés, natives appelées par leurs
+  interceptions, aucune retouche à la main). Build Switch LTO + PGO (profil de la 1.0.3 : il s'applique encore,
+  torchlight_recomp.50 sans avertissement) : .text 54,92 -> 52,38 Mo (-4,6 % ; -10,5 % depuis la 1.0.3) ; mêmes 2
+  sauts sur eux-mêmes. PC : deux sessions scriptées, 0 différence partout, images justes ; le chemin du personnage
+  diffère d'une session à l'autre de la même build (dialogues de PNJ selon leur position) : le script de manette
+  n'est pas reproductible au-delà de ~50 s. Essai : dist/torchlight-essai-nonarg.nro (859ac9fd, ELF
+  switch/elf/torchlight-essai-nonarg-20261101-1010.elf). Sauvegarde du code généré d'avant :
+  switch/out-pc/generated-avant-memoire-20261101.tar.zst (sans les REX_LR, remis par retour_sans_lr.py).
+- 2026-11-01 : **essai non_argument_as_local (+ ctx.lr non écrit) sur la console XJE1** (fréquences de base
+  vérifiées ; journaux switch-logs-archive/20261101-essai-nonarg/). Aucune erreur, pas de blocage. Ville, même
+  endroit, 242 dessins : 17,13-17,36 ms (44 images/s) contre 17,85-18,03 (essai ctx.lr) et 18,25-18,38 (1.0.3) :
+  -4 % et -6 %. Mine, même endroit (180 dessins) : 14,13-14,32 contre 14,81-14,90 (essai ctx.lr, 183) et
+  15,29-15,42 (essai mémoire, 181) : -4,5 %. Combat (comparaison approchée à nombre de dessins égal) : 276 dessins
+  22,8 ms, 286 23,8, 309 25,3 contre 280 24,0, 291 26,5, 322 26,2 (essai ctx.lr) : ~-5 %. Gardé.
+- 2026-11-01 : **mémoire sans volatile re-essayée par-dessus non_argument_as_local et ctx.lr, abandonnée.** Build
+  Switch .text 52,38 -> 51,01 Mo, 0 saut sur lui-même. Mais PC (session scriptée, natives en mode 2) : 1 parcours
+  de l'octree différent sur 54 000 (les trois sessions précédentes : 0 sur 52-56 000), venu du test de visibilité
+  sub_821C0E78 (Camera::isVisible) : native et recompilé, mêmes données au même moment, résultats différents. Cause
+  probable : le changement de mode des denormals (ctx.fpscr.disableFlushMode -> msr fpcr / _mm_setcsr) n'a pas de
+  clobber mémoire ; avec volatile, une lecture du jeu ne passait pas de l'autre côté, sans volatile la lecture et le
+  calcul flottant qui en dépend peuvent remonter avant le changement de mode (calcul dans le mauvais mode, visible
+  seulement sur des denormals). Sur la Switch, REX_LOAD_F32 reste en asm volatile, mais lfd (REX_LOAD_U64) et les
+  copies entières restent exposés. À corriger (clobber mémoire dans setcsr du SDK) avant tout nouvel essai ; gain
+  non démontré (-2 % au premier essai). Barrières retirées, option OFF.
+- 2026-11-01 : **relevé des piles de l'essai nonarg** (console XJE1, pilas-archive/rex_pilas-20261101-1139.txt,
+  ELF switch/elf/torchlight-essai-nonarg-20261101-1010.elf ; thread principal, 60 % de fin) : profil plat (aucune
+  fonction du jeu > 1,7 %) ; code du jeu ~72 %, natives ~17 % (WalkOctree 4,1 %, contrôleurs 3,4 %), relevé du
+  rendu natif 2,8 %, memcpy 2 %, malloc/free de newlib ~1,7 % dont attente de son verrou (svcArbitrateLock sous
+  _free_r appelé depuis sub_821EE1C0 : concurrence avec d'autres threads ; piste hors code généré), sommeil du jeu
+  1,25 %, sections critiques 0,28 % (piste « sections critiques en ligne » de renut-nx écartée).
+- 2026-11-01 : **rlwinm / rlwimi en décalages simples** (switch/tools/decalages_rlwinm.py, d'après
+  rotate_word_shifts de renut-nx ; lancé en dernier par build_switch.sh). rotl64(dup(x), SH) & M avec M sans tour
+  -> (uint32_t)(x << SH) & M, (x >> (32 - SH)) & M ou rotl32(x, SH) & M ; rlwimi : même chose sous masque
+  (GCC : bfi). 48 001 rlwinm et 4 123 rlwimi réécrits, 2 288 gardés (masque qui fait le tour). Test
+  switch/tools/test_decalages_rlwinm.py : paires du code (1 191, 9,7 M comparaisons) et toutes les paires (16 896,
+  138 M), 0 différence (le premier jet avait une condition fausse pour le décalage à droite, m >> (32 - SH) au lieu
+  de m >> SH : attrapée par le test). GCC de devkitA64 : 1 instruction au lieu de 2 (décalage), 1 au lieu de 2-3
+  (extraction), 1 au lieu de 4 (rlwimi). PC : session de contrôle, 0 différence, images justes. Pas d'essai console
+  seul (gain attendu ~0,5 %, sous le bruit). Code généré figé pour la session PGO.
+- 2026-11-01 (fin) : build instrumentée switch/out-pgo (code figé, main 589625f) envoyée sur la console XJE1
+  (profils de la console vidés, journaux archivés dans switch-logs-archive/20261101-avant-pgo6/) ; session PGO n°6
+  jouée par l'utilisateur, à récupérer à la prochaine session (étapes dans CLAUDE.md). Profil de la 1.0.3 gardé dans
+  pgo-103/ ; zip publié 1.0.3 protégé dans dist/torchlight-nx-1.0.3-publie.zip.
+- 2026-11-01 (soir) : **session PGO n°6 récupérée** (240 .gcda, 10 vidages, ~35 min de 20:55 à 21:30, ville, mine
+  et combats jusqu'à 350+ dessins ; journaux switch-logs-archive/20261101-pgo6/, profil dans pgo/). **1.0.4**
+  (TORCHLIGHT_VERSION passé à 1.0.4 avant build_joueurs.sh) : .text 52,00 Mo (1.0.3 : 58,54), 2 sauts sur
+  eux-mêmes (les voulus), .nro dist/torchlight-joueurs-1.0.4-20261101-2145.nro (MD5 6e78a8dd), ELF
+  switch/elf/torchlight-joueurs-1.0.4-20261101-2145.elf. Console XJE1, fréquences de base
+  (switch-logs-archive/20261101-joueurs-104/) : ville 242 dessins 17,42-17,60 ms (1.0.3 refaite le même soir :
+  18,25-18,38, -4,5 % ; essai nonarg avec l'ancien profil : 17,13-17,36, donc ~+1,5 %, juste au-dessus du bruit
+  d'une session à l'autre ; relevé natif 1,30 -> 1,23 ms : l'écart est dans le code généré) ; mine 184-185 dessins
+  14,56-14,67 (pas le même endroit que les essais) ; combat 352 dessins 28,7 ms. Cause possible de l'écart avec
+  nonarg, non vérifiée : les décalages rlwinm (jamais mesurés seuls sur la console) ou le profil n°6. A/B proposé
+  (nonarg puis 1.0.4 dans la même session), pas fait : l'utilisateur publie la 1.0.4 telle quelle.
+  Étude du même soir : setVertexBufferBinding (sub_821C3E78, 1,7 % du thread principal) ne vaut pas une native :
+  SetStreamSource déjà sauté, mise à jour des tampons périmés (sub_821A71E8, 0,4 %) nécessaire au rendu natif, et
+  le temps propre (1,2 %) est fait de défauts de cache sur les objets tampons que natif::Render relit juste après.
+  Mêmes conclusions pour setPass / _setTextureUnitSettings (le reste est lu par le natif) ; renderSingleObject et
+  les paramètres des programmes : ~1 % chacun pour un gros chantier.

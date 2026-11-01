@@ -18,7 +18,10 @@ grep -q '^file_path = "../assets/default.xex"' torchlight_manifest.toml
 # locals ») : registres PowerPC en variables locales C++ au lieu de champs de ctx en mémoire. Placées dans
 # [entrypoint] (lu comme configuration du générateur ; une clé ailleurs serait ignorée sans erreur). OPTIONS_CODEGEN
 # permet de les choisir pour un essai (vide = aucune).
-OPTIONS_CODEGEN="${OPTIONS_CODEGEN-cr_as_local xer_as_local ctr_as_local non_volatile_as_local}"
+# non_argument_as_local (2026-11-01, d'après renut-nx) : r0, r2, r11, r12, f0, v32-v63 en variables locales ; les
+# fonctions de non_arguments_gardes.txt (switch/tools/audit_non_arguments.py) les gardent dans ctx et leurs appelants
+# les leur passent (générateur du SDK modifié, switch/patches/nfsmw-sdk.patch).
+OPTIONS_CODEGEN="${OPTIONS_CODEGEN-cr_as_local xer_as_local ctr_as_local non_volatile_as_local non_argument_as_local}"
 # Morceaux de fonctions qui reçoivent des registres de leur voisine (lus avant d'être écrits, voir
 # tools/registres_lus_avant.py) : share_registers (la voisine passe ses variables par ctx). Fusionné dans la ligne
 # de l'adresse si elle existe déjà (une entrée du manifeste remplace toute entrée d'un fichier inclus).
@@ -49,6 +52,13 @@ for l in lignes:
     if l.startswith('includes = ') and options:
         sortie.append('# Options de génération ajoutées par gen_manifest.sh')
         sortie.extend('%s = true' % o for o in options)
+        if 'non_argument_as_local' in options:
+            gardes = []
+            for g in open('non_arguments_gardes.txt'):
+                g = g.split('#', 1)[0].strip()
+                if g:
+                    gardes.append('0x%08X' % int(g, 16))
+            sortie.append('non_argument_as_local_keep = [%s]' % ', '.join(gardes))
 while sortie and not sortie[-1].strip():
     sortie.pop()
 for a in marques:

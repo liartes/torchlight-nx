@@ -63,6 +63,15 @@ python3 "$HERE/tools/registres_locaux_boucles.py"
 python3 "$HERE/tools/appels_directs.py"
 # Accès à la pile sans volatile (switch/tools/pile_non_volatile.py) : idem, à refaire après chaque génération.
 python3 "$HERE/tools/pile_non_volatile.py"
+# Plus d'écriture de l'adresse de retour dans ctx.lr avant chaque appel (switch/tools/retour_sans_lr.py) : après
+# appels_indirects.py, qui accepte les deux formes de la ligne avant un bctrl.
+python3 "$HERE/tools/retour_sans_lr.py"
+# rlwinm / rlwimi en décalages et extractions simples (switch/tools/decalages_rlwinm.py, exact : test
+# switch/tools/test_decalages_rlwinm.py) : en dernier.
+python3 "$HERE/tools/decalages_rlwinm.py"
+# Mémoire du jeu sans volatile (switch/tools/memoire_non_volatile.py) : essayée le 2026-11-01, pas de gain sur la
+# console (ville ~2 % plus lente) ; étape retirée, outil gardé (à relancer en dernier, avec
+# -DTORCHLIGHT_MEMOIRE_NON_VOLATILE=ON, puis switch/tools/boucles_infinies.py sur l'ELF).
 
 DOCKER=docker
 if ! docker info >/dev/null 2>&1; then DOCKER="sg docker -c"; fi

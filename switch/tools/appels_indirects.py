@@ -113,8 +113,10 @@ def main():
                                         ligne.startswith('\tif (REX_PROMOTED_IS(')):
                 continue
             m = SIMPLE.match(ligne) or SITE.match(ligne) or PROMU.match(ligne)
-            # Seulement la forme simple d'un `bctrl` : « // bctrl », « ctx.lr = ... », l'appel.
-            if not m or i < 2 or not lignes[i - 2].startswith('\t// bctrl') or not lignes[i - 1].startswith('\tctx.lr = '):
+            # Seulement la forme simple d'un `bctrl` : « // bctrl », « ctx.lr = ... » (ou « REX_LR(...); » après
+            # retour_sans_lr.py), l'appel.
+            if not m or i < 2 or not lignes[i - 2].startswith('\t// bctrl') or \
+                    not lignes[i - 1].startswith(('\tctx.lr = ', '\tREX_LR(')):
                 continue
             site = numero
             numero += 1
