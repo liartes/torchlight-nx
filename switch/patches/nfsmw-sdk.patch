@@ -257,7 +257,7 @@ index 5da54a0..a9fc6f7 100644
              hasBool("generate_exception_handlers"), "generate_exception_handlers");
    if (hasBool("is_dll")) {
 diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
-index 34cd4ed..7ffed2b 100644
+index 34cd4ed..ce2db6a 100644
 --- a/sdk/src/core/guest_memory_switch.cpp
 +++ b/sdk/src/core/guest_memory_switch.cpp
 @@ -2,6 +2,7 @@
@@ -268,7 +268,7 @@ index 34cd4ed..7ffed2b 100644
  #include "guest_memory_switch.h"
  
  #include <malloc.h>
-@@ -22,6 +23,24 @@ constexpr size_t kPageSize  = 0x1000;
+@@ -22,10 +23,53 @@ constexpr size_t kPageSize  = 0x1000;
   * page table.
   */
  constexpr size_t kBlockSize = 0x200000;
@@ -293,7 +293,85 @@ index 34cd4ed..7ffed2b 100644
  
  constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
  constexpr size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
-@@ -423,6 +442,18 @@ size_t RexGmCommittedBytes(void) {
+ 
++/*
++ * Commit grid. Guest physical memory (mapping offsets 0x100000000 and up) is committed with a
++ * 4 KB phase: the 0xE0000000 view reaches it 4 KB further on, so a chunk that starts at
++ * 0x...1000 covers exactly one 2 MB block of that view, and the kernel can use a block
++ * descriptor there. The raw physical view is placed in the same phase (xmemory.cpp). Measured on
++ * the console (Torchlight): a TLB miss in that view cost 130 ns in 4 KB pages, as much as a RAM
++ * access, and it holds most of the game's physical memory.
++ */
++constexpr size_t kPhysicalBegin = 0x100000000;
++constexpr size_t kPhysicalEnd   = 0x120000000;
++constexpr size_t kPhysicalPhase = 0x1000;
++
++constexpr size_t GridDown(size_t v) {
++    if (v < kPhysicalBegin || v >= kPhysicalEnd) return AlignDown(v, kCommitGranule);
++    if (v < kPhysicalBegin + kPhysicalPhase) return kPhysicalBegin;
++    return AlignDown(v - kPhysicalPhase, kCommitGranule) + kPhysicalPhase;
++}
++
++constexpr size_t GridUp(size_t v) {
++    if (v <= kPhysicalBegin || v > kPhysicalEnd) return AlignUp(v, kCommitGranule);
++    if (v <= kPhysicalBegin + kPhysicalPhase) return kPhysicalBegin + kPhysicalPhase;
++    const size_t up = AlignUp(v - kPhysicalPhase, kCommitGranule) + kPhysicalPhase;
++    return up < kPhysicalEnd ? up : kPhysicalEnd;
++}
++
+ /* A committed chunk: heap backing, its code alias (the shadow), and the span of the mapping it covers. */
+ struct Chunk {
+     size_t offset;      /* offset in the mapping */
+@@ -350,14 +394,46 @@ void ReleaseChunk(const Chunk& c) {
+ 
+ extern "C" {
+ 
++static std::atomic<uint64_t> g_chrono_appels[kRexChronoGenres], g_chrono_ticks[kRexChronoGenres];
++
++uint64_t RexChronoTicks(void) { return armGetSystemTick(); }
++
++static std::atomic<RexChronoFichierFn> g_chrono_fichier{nullptr};
++void RexChronoFichierCrochet(RexChronoFichierFn fn) { g_chrono_fichier.store(fn, std::memory_order_release); }
++void RexChronoFichier(const char* chemin) {
++    if (RexChronoFichierFn fn = g_chrono_fichier.load(std::memory_order_acquire)) fn(chemin);
++}
++
++void RexChronoAjoute(int genre, uint64_t ticks) {
++    g_chrono_appels[genre].fetch_add(1, std::memory_order_relaxed);
++    g_chrono_ticks[genre].fetch_add(ticks, std::memory_order_relaxed);
++}
++
++void RexChronoLire(uint64_t* appels, uint64_t* ticks) {
++    for (int i = 0; i < kRexChronoGenres; ++i) {
++        appels[i] = g_chrono_appels[i].load(std::memory_order_relaxed);
++        ticks[i] = g_chrono_ticks[i].load(std::memory_order_relaxed);
++    }
++}
++
+ uint8_t* RexGmInit(size_t size) {
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (s.base) return s.base;
+ 
++    /*
++     * virtmemFindAslr takes a guard size, not an alignment: what it returns is only
++     * page aligned. The kernel uses a 2 MB block only where the virtual and physical
++     * addresses are aligned alike, so an unaligned window forces 4 KB pages on all the
++     * guest memory, whatever the chunks do (Torchlight, measured on the console: a TLB
++     * miss there costs 100 to 170 ns). Ask for 2 MB more and round the base up.
++     */
+     virtmemLock();
+-    s.base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
+-    if (s.base) s.reservation = virtmemAddReservation(s.base, size);
++    uint8_t* hueco = static_cast<uint8_t*>(virtmemFindAslr(size + kBlockSize, kBlockSize));
++    if (hueco) {
++        s.base = reinterpret_cast<uint8_t*>(AlignUp(reinterpret_cast<size_t>(hueco), kBlockSize));
++        s.reservation = virtmemAddReservation(s.base, size);
++    }
+     virtmemUnlock();
+ 
+     if (!s.base || !s.reservation) {
+@@ -423,6 +499,18 @@ size_t RexGmCommittedBytes(void) {
      return s.committed;
  }
  
@@ -312,22 +390,87 @@ index 34cd4ed..7ffed2b 100644
  size_t RexGmMappedBytes(void) {
      State& s = S();
      std::lock_guard<std::mutex> lock(s.mutex);
-@@ -478,8 +509,8 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+@@ -461,6 +549,7 @@ bool RexGmAddView(uint8_t* base, size_t offset, size_t length) {
+ }
+ 
+ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
++  RexChrono chrono(kRexChronoCommit);
+     /*
+      * Memory is always committed accessible. Restricting permissions is the job of
+      * RexGmProtect, which works on window addresses and not on mapping offsets (and
+@@ -478,8 +567,8 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
      std::lock_guard<std::mutex> lock(s.mutex);
      if (!s.base) return false;
  
 -    const size_t begin = AlignDown(offset, kPageSize);
 -    const size_t end   = AlignUp(offset + length, kPageSize);
-+    const size_t begin = AlignDown(offset, kCommitGranule);
-+    const size_t end   = std::min(AlignUp(offset + length, kCommitGranule), s.size);
++    const size_t begin = GridDown(offset);
++    const size_t end   = std::min(GridUp(offset + length), s.size);
  
      size_t cur = begin;
      while (cur < end) {
+@@ -495,8 +584,7 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+             hueco_fin = sig->second.offset;
+ 
+         const size_t tam = hueco_fin - cur;
+-        const size_t align = (tam >= kBlockSize && (cur & (kBlockSize - 1)) == 0)
+-                                 ? kBlockSize : kPageSize;
++        const size_t align = (tam >= kBlockSize && GridDown(cur) == cur) ? kBlockSize : kPageSize;
+ 
+         void* backing = memalign(align, tam);
+         if (!backing) {
+@@ -548,6 +636,7 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+ }
+ 
+ bool RexGmFaultIn(uint64_t window_address) {
++  RexChrono chrono(kRexChronoFaute);
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (!s.base) return false;
+@@ -575,6 +664,7 @@ bool RexGmFaultIn(uint64_t window_address) {
+ }
+ 
+ bool RexGmDecommit(size_t offset, size_t length) {
++  RexChrono chrono(kRexChronoDecommit);
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (!s.base) return false;
+@@ -602,6 +692,7 @@ bool RexGmDecommit(size_t offset, size_t length) {
+ }
+ 
+ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAccess* out_old) {
++  RexChrono chrono(kRexChronoProtect);
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (!s.base) return false;
 diff --git a/sdk/src/core/guest_memory_switch.h b/sdk/src/core/guest_memory_switch.h
-index 3c9501e..0fddb89 100644
+index 3c9501e..b85b869 100644
 --- a/sdk/src/core/guest_memory_switch.h
 +++ b/sdk/src/core/guest_memory_switch.h
-@@ -167,6 +167,11 @@ size_t RexGmCommittedBytes(void);
+@@ -68,6 +68,22 @@ typedef enum {
+     REX_GM_WRITE = (1 << 0) | (1 << 1),  /* lectura + escritura */
+ } RexGmAccess;
+ 
++/*
++ * Torchlight: cumulative calls and time of the operations that can stall a frame, read by the long
++ * frame log (--torchlight_images_longues). Ticks of armGetSystemTick.
++ */
++enum {
++    kRexChronoCommit, kRexChronoFaute, kRexChronoProtect, kRexChronoDecommit,
++    kRexChronoAllocPhys, kRexChronoLibPhys, kRexChronoAllocVirt, kRexChronoLibVirt,
++    kRexChronoLecture, kRexChronoOuverture, kRexChronoD3dx, kRexChronoGenres
++};
++uint64_t RexChronoTicks(void);
++void RexChronoAjoute(int genre, uint64_t ticks);
++void RexChronoLire(uint64_t* appels, uint64_t* ticks);
++typedef void (*RexChronoFichierFn)(const char* chemin);
++void RexChronoFichierCrochet(RexChronoFichierFn fn);
++void RexChronoFichier(const char* chemin);
++
+ /* Reserves the window. size is usually 0x120000000. Returns the base or NULL. */
+ uint8_t* RexGmInit(size_t size);
+ 
+@@ -167,6 +183,11 @@ size_t RexGmCommittedBytes(void);
   */
  size_t RexGmMappedBytes(void);
  
@@ -339,6 +482,20 @@ index 3c9501e..0fddb89 100644
  /*
   * Tells whether watched pages are protected with permissions (readable) or by
   * unmapping (not readable). It is printed in the profile header to show which
+@@ -193,4 +214,13 @@ uint32_t RexGmLastResult(void);
+ }
+ #endif
+ 
++#ifdef __cplusplus
++struct RexChrono {
++    int genre;
++    uint64_t debut;
++    explicit RexChrono(int g) : genre(g), debut(RexChronoTicks()) {}
++    ~RexChrono() { RexChronoAjoute(genre, RexChronoTicks() - debut); }
++};
++#endif
++
+ #endif /* __SWITCH__ */
 diff --git a/sdk/src/core/memory_switch.cpp b/sdk/src/core/memory_switch.cpp
 index da1643f..a13f00c 100644
 --- a/sdk/src/core/memory_switch.cpp
@@ -1039,6 +1196,98 @@ index 5a572ce..a3a28f9 100644
  REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
  REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
  REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index d8fac47..d42dde0 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -40,6 +40,12 @@
+ #include <string>
+ #include <utility>
+ #include <vector>
++#if defined(__SWITCH__)
++#include "../../core/guest_memory_switch.h"
++#define REX_CHRONO(g) RexChrono rex_chrono(g)
++#else
++#define REX_CHRONO(g)
++#endif
+ 
+ /*
+  * I/O measurement.
+@@ -491,6 +497,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                        u32 file_attributes, u32 share_access, u32 creation_disposition,
+                        u32 create_options) {
++  REX_CHRONO(kRexChronoOuverture);
+   // note used. maybe later
+   // uint64_t allocation_size = 0;  // is this correct???
+   // if (allocation_size_ptr) {
+@@ -509,6 +516,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ 
+   // Compute path, possibly attrs relative.
+   auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
++#if defined(__SWITCH__)
++  RexChronoFichier(std::string(target_path).c_str());
++#endif
+   REXKRNL_IMPORT_TRACE(
+       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
+       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
+@@ -588,6 +598,7 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
++  REX_CHRONO(kRexChronoLecture);
+   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
+   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+   REXKRNL_IMPORT_TRACE(
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..6088a0a 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -22,6 +22,12 @@
+ #include <rex/types.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
++#if defined(__SWITCH__)
++#include "../../core/guest_memory_switch.h"
++#define REX_CHRONO(g) RexChrono rex_chrono(g)
++#else
++#define REX_CHRONO(g)
++#endif
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+@@ -62,6 +68,7 @@ uint32_t FromXdkProtectFlags(uint32_t protect) {
+ 
+ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
+                                   u32 alloc_type, u32 protect_bits, u32 debug_memory) {
++  REX_CHRONO(kRexChronoAllocVirt);
+   uint32_t input_base = base_addr_ptr ? static_cast<uint32_t>(*base_addr_ptr) : 0;
+   uint32_t input_size = region_size_ptr ? static_cast<uint32_t>(*region_size_ptr) : 0;
+   REXKRNL_IMPORT_TRACE(
+@@ -247,6 +254,7 @@ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_siz
+ 
+ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr, u32 free_type,
+                               u32 debug_memory) {
++  REX_CHRONO(kRexChronoLibVirt);
+   uint32_t base_addr_value = *base_addr_ptr;
+   uint32_t region_size_value = *region_size_ptr;
+   REXKRNL_IMPORT_TRACE("NtFreeVirtualMemory", "base={:#x} size={:#x} type={:#x} debug={}",
+@@ -346,6 +354,7 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
+ 
+ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bits,
+                                      u32 min_addr_range, u32 max_addr_range, u32 alignment) {
++  REX_CHRONO(kRexChronoAllocPhys);
+   REXKRNL_IMPORT_TRACE("MmAllocatePhysicalMemoryEx",
+                        "flags={:#x} size={:#x} protect={:#x} min={:#x} max={:#x} align={:#x}",
+                        (uint32_t)flags, (uint32_t)region_size, (uint32_t)protect_bits,
+@@ -412,6 +421,7 @@ u32 MmAllocatePhysicalMemory_entry(u32 flags, u32 region_size, u32 protect_bits)
+ }
+ 
+ void MmFreePhysicalMemory_entry(u32 type, u32 base_address) {
++  REX_CHRONO(kRexChronoLibPhys);
+   REXKRNL_IMPORT_TRACE("MmFreePhysicalMemory", "type={:#x} addr={:#x}", (uint32_t)type,
+                        (uint32_t)base_address);
+ 
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 index 57fd161..9427c88 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
@@ -1183,6 +1432,58 @@ index 4179e8b..708b7e5 100644
  }
  
  uint64_t XFile::position() const {
+diff --git a/sdk/src/system/xmemory.cpp b/sdk/src/system/xmemory.cpp
+index 9ab905b..f81a3ed 100644
+--- a/sdk/src/system/xmemory.cpp
++++ b/sdk/src/system/xmemory.cpp
+@@ -131,6 +131,17 @@ Memory::~Memory() {
+   physical_membase_ = nullptr;
+ }
+ 
++// Switch: where the raw physical view sits in the guest window, past 0x100000000. The 0xE0000000 view
++// reaches physical memory 4 KB further on (a 360 quirk), so the kernel can only give it 2 MB blocks if
++// physical memory is committed with that same 4 KB phase (guest_memory_switch.cpp). This offset puts the
++// raw view in phase too. The 0xA0000000, 0xC0000000 and 0x7F000000 views, whose addresses are fixed by
++// the guest, stay in 4 KB pages; the game uses them far less (Torchlight: about 27 MB against 230 MB).
++#if REX_PLATFORM_SWITCH
++static constexpr uint64_t kPhysicalViewOffset = 0x1FF000;
++#else
++static constexpr uint64_t kPhysicalViewOffset = 0;
++#endif
++
+ bool Memory::Initialize() {
+   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+ 
+@@ -138,7 +149,8 @@ bool Memory::Initialize() {
+   // uncommitted (so it shouldn't expand page file).
+   // Round up to allocation granularity to accommodate platforms with large pages.
+   const size_t mapping_size =
+-      rex::round_up(static_cast<size_t>(0x120000000ull) + system_allocation_granularity_,
++      rex::round_up(static_cast<size_t>(0x120000000ull + kPhysicalViewOffset) +
++                        system_allocation_granularity_,
+                     static_cast<size_t>(system_allocation_granularity_));
+   mapping_ = rex::memory::CreateFileMappingHandle(file_name_, mapping_size,
+                                                   rex::memory::PageAccess::kReadWrite, false);
+@@ -186,7 +198,7 @@ bool Memory::Initialize() {
+   }
+ #endif
+   virtual_membase_ = mapping_base_;
+-  physical_membase_ = mapping_base_ + 0x100000000ull;
++  physical_membase_ = mapping_base_ + 0x100000000ull + kPhysicalViewOffset;
+ 
+   REXSYS_INFO("Guest memory arena mapped: virtual base 0x{:016X}, physical base 0x{:016X}",
+               reinterpret_cast<uintptr_t>(virtual_membase_),
+@@ -331,8 +343,8 @@ static const struct {
+     },
+     //          - physical raw
+     {
+-        0x100000000,
+-        0x11FFFFFFF,
++        0x100000000 + kPhysicalViewOffset,
++        0x11FFFFFFF + kPhysicalViewOffset,
+         0x0000000100000000ull,
+     },
+ };
 diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
 index b4c89f1..a606352 100644
 --- a/sdk/src/ui/presenter.cpp
@@ -1213,8 +1514,22 @@ index b4c89f1..a606352 100644
    GuestOutputProperties& writable_properties =
        guest_output_properties_[guest_output_mailbox_writable_];
    writable_properties.frontbuffer_width = frontbuffer_width;
+diff --git a/sdk/src/ui/switch_apm.cpp b/sdk/src/ui/switch_apm.cpp
+index b71ce09..04fa431 100644
+--- a/sdk/src/ui/switch_apm.cpp
++++ b/sdk/src/ui/switch_apm.cpp
+@@ -328,6 +328,9 @@ extern "C" void RexSwitchApmVigilar(void) {
+   if (!LeerRelojes(gpu, emc) || emc <= emc0 + kMargenHz) {
+     return;  // where it should be
+   }
++  if (gpu < 100000000u) {
++    return;  // CPU boost mode (GPU 76.8 MHz): that profile sets the memory clock, and the system gives it back afterwards
++  }
+ 
+   /* It moved: the configuration raised it after we checked. */
+   const bool bajada = FijarMemoria(emc0);
 diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
-index 6b3d30a..a883661 100644
+index 6b3d30a..d222cbd 100644
 --- a/sdk/src/ui/switch_perf.cpp
 +++ b/sdk/src/ui/switch_perf.cpp
 @@ -63,6 +63,8 @@ const char* RexSwitchLogDir(void);
@@ -1325,16 +1640,22 @@ index 6b3d30a..a883661 100644
    // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
    // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
    // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
-@@ -551,6 +611,18 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+@@ -551,6 +611,24 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
  
    std::vector<Sample> samples(g_samples, g_samples + g_sample_count);
    g_sample_count = 0;
 +  // Torchlight : échantillons bruts (rex_pilas.txt) pour une agrégation complète hors de la console :
 +  // une ligne par échantillon, nom du thread puis pc et adresses de retour, relatifs à l'image.
++  // « T: » devant le nom : échantillon pris pendant une image longue (RexSwitchPerfTiron).
 +  if (!samples.empty()) {
 +    if (FILE* raw = std::fopen((std::string(RexSwitchLogDir()) + "rex_pilas.txt").c_str(), "a")) {
++      const u32 longues = std::min<u32>(g_num_tirones.load(), kMaxTirones);
 +      for (const Sample& smp : samples) {
-+        std::fprintf(raw, "%s|%" PRIx64, g_slots[smp.slot].name, smp.pc - g_base);
++        bool longue = false;
++        for (u32 w = 0; w < longues && !longue; ++w) {
++          longue = smp.tick >= g_tirones[w].inicio && smp.tick <= g_tirones[w].fin;
++        }
++        std::fprintf(raw, "%s%s|%" PRIx64, longue ? "T:" : "", g_slots[smp.slot].name, smp.pc - g_base);
 +        for (size_t k = 0; k < kFrames && smp.frames[k]; ++k) std::fprintf(raw, " %" PRIx64, smp.frames[k] - g_base);
 +        std::fprintf(raw, "\n");
 +      }
@@ -1344,7 +1665,7 @@ index 6b3d30a..a883661 100644
    std::sort(samples.begin(), samples.end(),
              [](const Sample& a, const Sample& b) { return a.slot < b.slot; });
  
-@@ -816,6 +888,11 @@ void ProfilerMain(void*) {
+@@ -816,6 +894,11 @@ void ProfilerMain(void*) {
    if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
      std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
                   g_text_hi);
@@ -1356,6 +1677,158 @@ index 6b3d30a..a883661 100644
      std::fprintf(f, "Muestreo de pilas: %s\n", sample_stacks ? "activo (1 ms)" : "desactivado");
      std::fclose(f);
    }
+@@ -830,12 +913,26 @@ void ProfilerMain(void*) {
+ 
+   size_t rr = 0;
+   size_t mode_index = 0;
++  // Torchlight : un échantillon sur quatre pour le thread principal du jeu (~250 par seconde au lieu de ~20) : assez pour
++  // voir une image longue de 270 ms. Seulement avec le relevé des piles, qui ralentit déjà le jeu.
++  size_t principal = kMaxThreads;
++  u32 tour = 0;
+   while (true) {
+     __real_svcSleepThread(sample_stacks ? kSampleIntervalNs : kPassiveIntervalNs);
+ 
++    if (sample_stacks && principal == kMaxThreads) {
++      for (size_t i = 0; i < kMaxThreads; ++i) {
++        if (std::strncmp(g_slots[i].name, "Main XThread", 12) == 0) {
++          principal = i;
++          break;
++        }
++      }
++    }
++    const bool prioritaire = principal != kMaxThreads && (++tour & 3) == 0;
+     for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
+-      const size_t idx = rr;
+-      rr = (rr + 1) % kMaxThreads;
++      const bool sur_principal = prioritaire && tries == 0;
++      const size_t idx = sur_principal ? principal : rr;
++      if (!sur_principal) rr = (rr + 1) % kMaxThreads;
+       Slot& s = g_slots[idx];
+       const u32 h = s.handle.load();
+       if (!h || !s.busy) {
+@@ -1021,6 +1118,92 @@ void __wrap_svcSleepThread(s64 nano) {
+  * shadow, 4 = SEH. 28..32 = draws per surface width from IssueDraw
+  * (1600 or more, 1280-1599, 640-1279, 256-639, under 256).
+  */
++/*
++ * Torchlight (src/torchlight_coeurs.cpp) : réserve un cœur au thread appelant. coeur >= 0 : l'appelant n'a plus que ce
++ * cœur, et il est retiré du masque de tous les threads de g_slots et du profileur. coeur < 0 : masques d'origine rendus.
++ * Un seul appelant. À rappeler de temps en temps : prend les nouveaux threads et ceux qui ont refait leur masque.
++ * Rend le nombre de threads qui n'ont que ce cœur et y restent.
++ */
++int RexSwitchReserverCoeur(int coeur) {
++  struct Garde {
++    u32 handle;
++    s32 prefere;
++    u64 masque;
++  };
++  static Garde gardes[kMaxThreads + 1];
++  static Garde moi;
++  static u64 mon_id = 0;
++  if (mon_id == 0) {
++    svcGetThreadId(&mon_id, CUR_THREAD_HANDLE);
++  }
++  const u64 bit = coeur >= 0 ? u64(1) << coeur : 0;
++  int restes = 0;
++  for (size_t i = 0; i <= kMaxThreads; ++i) {
++    const u32 h = i < kMaxThreads ? g_slots[i].handle.load() : u32(g_thread.handle);
++    Garde& g = gardes[i];
++    u64 id = 0;
++    s32 prefere = -1;
++    u64 masque = 0;
++    if (!h || R_FAILED(svcGetThreadId(&id, h)) || id == mon_id ||
++        R_FAILED(svcGetThreadCoreMask(&prefere, &masque, h))) {
++      g.handle = 0;
++      continue;
++    }
++    if (coeur < 0) {
++      if (g.handle == h && (g.masque != masque || g.prefere != prefere)) {
++        svcSetThreadCoreMask(h, g.prefere, g.masque);
++      }
++      g.handle = 0;
++      continue;
++    }
++    // Masque qui contient le cœur : pas encore touché, ou refait par le thread (Mesa, rendu, particules) : c'est
++    // lui, l'origine à rendre.
++    if (g.handle != h || (masque & bit) != 0) {
++      g = {h, prefere, masque};
++    }
++    const u64 nouveau = masque & ~bit;
++    if (nouveau == 0) {
++      ++restes;
++    } else if (nouveau != masque) {
++      svcSetThreadCoreMask(h, prefere == coeur ? -1 : prefere, nouveau);
++    }
++  }
++  if (coeur >= 0) {
++    s32 prefere = -1;
++    u64 masque = 0;
++    if (R_SUCCEEDED(svcGetThreadCoreMask(&prefere, &masque, CUR_THREAD_HANDLE)) && masque != bit) {
++      moi = {1, prefere, masque};
++      svcSetThreadCoreMask(CUR_THREAD_HANDLE, coeur, bit);
++    }
++  } else if (moi.handle != 0) {
++    svcSetThreadCoreMask(CUR_THREAD_HANDLE, moi.prefere, moi.masque);
++    moi.handle = 0;
++  }
++  return restes;
++}
++
++/*
++ * Torchlight : état relu auprès du noyau, pour vérifier la réservation dans le journal. Rend le nombre d'autres threads
++ * connus dont le masque contient ce cœur ; *masque = masque du thread appelant.
++ */
++int RexSwitchEtatCoeur(int coeur, u64* masque) {
++  s32 prefere = -1;
++  *masque = 0;
++  svcGetThreadCoreMask(&prefere, masque, CUR_THREAD_HANDLE);
++  u64 mon_id = 0;
++  svcGetThreadId(&mon_id, CUR_THREAD_HANDLE);
++  int avec = 0;
++  for (size_t i = 0; i <= kMaxThreads; ++i) {
++    const u32 h = i < kMaxThreads ? g_slots[i].handle.load() : u32(g_thread.handle);
++    u64 id = 0, m = 0;
++    if (!h || R_FAILED(svcGetThreadId(&id, h)) || id == mon_id || R_FAILED(svcGetThreadCoreMask(&prefere, &m, h))) {
++      continue;
++    }
++    avec += (m >> coeur) & 1;
++  }
++  return avec;
++}
++
+ // A long frame, in armGetSystemTick ticks (see VentanaTiron).
+ void RexSwitchPerfTiron(u64 inicio, u64 fin) {
+   const u32 i = g_num_tirones.fetch_add(1);
+diff --git a/sdk/src/ui/vulkan/vulkan_instance.cpp b/sdk/src/ui/vulkan/vulkan_instance.cpp
+index d7559e4..0421633 100644
+--- a/sdk/src/ui/vulkan/vulkan_instance.cpp
++++ b/sdk/src/ui/vulkan/vulkan_instance.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <cstring>
+ #include <sstream>
+ #include <string>
+ #include <unordered_map>
+@@ -593,6 +595,16 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
+     VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
+     VkDebugUtilsMessageTypeFlagsEXT message_types,
+     const VkDebugUtilsMessengerCallbackDataEXT* callback_data, [[maybe_unused]] void* user_data) {
++  // Torchlight : quand le GPU prend du retard, ce message revient à chaque image, et un avertissement vide le journal sur
++  // la carte SD depuis le thread de rendu (flush_level = warn). Une ligne sur 1000 suffit ; les erreurs restent toutes.
++  if (message_severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT && callback_data->pMessage &&
++      std::strstr(callback_data->pMessage, "native submission pressure")) {
++    static std::atomic<uint32_t> nombre{0};
++    if (nombre.fetch_add(1, std::memory_order_relaxed) % 1000 != 0) {
++      return VK_FALSE;
++    }
++  }
++
+   std::ostringstream log_str;
+ 
+   log_str << "Vulkan " << vk::to_string(vk::DebugUtilsMessageSeverityFlagBitsEXT(message_severity))
 diff --git a/sdk/thirdparty/CMakeLists.txt b/sdk/thirdparty/CMakeLists.txt
 index aa3c58c..4a09c14 100644
 --- a/sdk/thirdparty/CMakeLists.txt

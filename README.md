@@ -84,10 +84,12 @@ The game uses the language of your console when it has it: French (including Can
 An optional `torchlight.toml` placed next to `torchlight.nro` overrides the built-in settings. The defaults are the
 ones in [`switch/torchlight.toml`](switch/torchlight.toml), which explains each of them. You don't need it to play.
 
-The port targets the stock clocks. Overclocking (for example with sys-clk) is your choice and is not required.
-If you do overclock, raise the **CPU**: the game is limited by its main thread, and a faster GPU makes no
-difference. During loading screens the port already asks the system for its official CPU boost mode, the one the
-console's own games use for loading, and goes back to normal clocks as soon as the game is running again.
+The port targets the stock clocks. In handheld mode it asks the system for the official 460.8 MHz GPU profile, which
+is not an overclock and leaves the memory clock alone; it uses more battery, and `torchlight_gpu_mhz = 0` in
+`torchlight.toml` turns it off. Overclocking (for example with sys-clk) is your choice and is not required.
+If you do overclock, raise the **CPU**: the game is mostly limited by its main thread. During loading screens the
+port already asks the system for its official CPU boost mode, the one the console's own games use for loading, and
+goes back to normal clocks as soon as the game is running again.
 
 ## Known issues
 
@@ -161,7 +163,7 @@ This port would not exist without the work of these projects and their developer
   analysis showed which off-screen scenery to skip and which of the game's Xbox Direct3D work can be left out.
 - [torchlight-rekindled](https://github.com/GreenSwampDweller/torchlight-rekindled) by GreenSwampDweller: its way
   of handing part of Ogre's per-object work to worker threads is what led this port to update the particle effects
-  on several cores.
+  and the skeleton poses on several cores.
 
 **Switch homebrew**
 
@@ -175,6 +177,7 @@ This port would not exist without the work of these projects and their developer
 - [Dear ImGui](https://github.com/ocornut/imgui): the installation window and menus.
 - [FFmpeg](https://github.com/FFmpeg/FFmpeg) and [libmspack](https://github.com/kyz/libmspack): media decoding and
   decompression in the runtime.
+- [zlib](https://zlib.net): decompression of the game's data.
 - [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
   [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) and
   [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers).

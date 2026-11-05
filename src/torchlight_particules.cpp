@@ -34,6 +34,7 @@
 // principal (mêmes interceptions : validation par le suivi mémoire) ; 2 = en parallèle (défaut depuis l'A/B du
 // 2026-10-28 sur la console : boucle des contrôleurs en combat 6,8-8,7 -> 3,7-5,0 ms par image, effets normaux).
 
+#include "torchlight_coeurs.h"
 #include "torchlight_particules.h"
 
 #include <algorithm>
@@ -61,6 +62,11 @@ REXCVAR_DEFINE_INT32(torchlight_particules, 2, "Torchlight",
                      "Systèmes de ParticleUniverse mis à jour : 0 = comme le jeu ; 1 = mis de côté puis en série "
                      "(validation) ; 2 = en parallèle sur d'autres cœurs")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(torchlight_billboards, 0, "Torchlight",
+                     "Sommets des billboards de ParticleUniverse : 0 = comme le jeu ; 1 = boucles différées à la fin du "
+                     "parcours de l'octree, en série ; 2 = en parallèle ; 3 = validation (faites aux deux moments, "
+                     "comparées à l'octet)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(torchlight_particules_threads, 2, "Torchlight",
                      "Threads de travail pour les particules (en plus du thread principal)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -75,7 +81,16 @@ REX_EXTERN(__imp__sub_8247A588);  // BillboardSet::setPoolSize
 #if !defined(__SWITCH__)
 // Suivi mémoire (switch/tools/suivi_memoire, build PC de diagnostic seulement) : sections en série.
 extern "C" __attribute__((weak)) void SuiviSerie(int entree) noexcept;
+// Suivi mémoire des billboards (switch/tools/suivi_memoire/suivi_billboards.cpp, build PC de diagnostic).
+extern "C" __attribute__((weak)) void SuiviBillboardsParcours(PPCContext& ctx, uint8_t* base, int debut) noexcept;
+extern "C" __attribute__((weak)) void SuiviBillboardsPoste(uint32_t renderer) noexcept;
+extern "C" __attribute__((weak)) void SuiviBillboardsTache(uint32_t renderer, int debut) noexcept;
 #endif
+
+REX_EXTERN(sub_821E3C00);
+REX_EXTERN(sub_821DD8A8);
+REX_EXTERN(sub_821A7AF0);
+extern "C" void torchlight_billboards_boucle(PPCContext& __restrict ctx, uint8_t* base);
 
 namespace torchlight::particules {
 namespace {
@@ -119,9 +134,32 @@ struct Tache {
 
 std::vector<Tache> g_taches;
 size_t g_nombre = 0;  // tâches valides de g_taches (les vecteurs des différés sont gardés d'une image à l'autre)
+std::vector<uint32_t> g_ordre;  // indices des tâches, les plus coûteuses d'abord
 thread_local Tache* t_tache = nullptr;
 std::recursive_mutex g_serie;
 thread_local int t_serie = 0;
+
+// Les verrous du groupe et des sections en série ne sont tenus que quelques µs, mais l'attente passait par le noyau : au
+// menu, 2,2 % du thread principal bloqué sur le verrou du tri des particules, pour 0,14 % de tri (relevé du 2026-11-04).
+// Quelques µs d'essais avant d'y aller ; un détenteur mis en pause retombe sur l'attente normale.
+constexpr int kEssaisVerrou = 400;
+
+inline void PauseCourte() {
+#if defined(__aarch64__)
+  __asm__ volatile("yield");
+#elif defined(__x86_64__)
+  __builtin_ia32_pause();
+#endif
+}
+
+template <typename Verrou>
+void PrendreVerrou(Verrou& v) {
+  for (int i = 0; i < kEssaisVerrou; i++) {
+    if (v.try_lock()) return;
+    PauseCourte();
+  }
+  v.lock();
+}
 
 struct Bilan {
   uint64_t images = 0, prises = 0, refus_etat = 0, refus_rendu = 0, refus_prepa = 0, refus_fin = 0, differes = 0,
@@ -137,13 +175,13 @@ void Rapport() {
   if (maintenant - dernier < std::chrono::seconds(10) || !g_bilan.images) return;
   dernier = maintenant;
   const double n = double(g_bilan.images);
-  REXLOG_INFO("[particules] par image : {:.1f} systèmes en parallèle, refusés {:.1f} (état) {:.1f} (rendu) {:.1f} "
+  if (torchlight::coeurs::JournalStats()) REXLOG_INFO("[particules] par image : {:.1f} systèmes en parallèle, refusés {:.1f} (état) {:.1f} (rendu) {:.1f} "
               "(préparation) {:.1f} (fin) ; {:.1f} caméras ; ms : {:.3f} mises à jour, {:.3f} différés rejoués "
               "({:.1f}) ; annulées {}, destructions pendant les tâches {}",
               g_bilan.prises / n, g_bilan.refus_etat / n, g_bilan.refus_rendu / n, g_bilan.refus_prepa / n,
               g_bilan.refus_fin / n, g_bilan.cameras / n, g_bilan.ms / n, g_bilan.ms_differes / n,
               g_bilan.differes / n, g_bilan.annulees, g_destructions.load(std::memory_order_relaxed));
-  REXLOG_INFO("[particules] refus de préparation (+680 +681 +682 renderer +66 +189 +190 +191 +192) : {} {} {} {} {} {} {} {}",
+  if (torchlight::coeurs::JournalStats()) REXLOG_INFO("[particules] refus de préparation (+680 +681 +682 renderer +66 +189 +190 +191 +192) : {} {} {} {} {} {} {} {}",
               g_prepa[0], g_prepa[1], g_prepa[2], g_prepa[3], g_prepa[4], g_prepa[5], g_prepa[6], g_prepa[7]);
   std::memset(g_prepa, 0, sizeof g_prepa);
   g_bilan = Bilan{};
@@ -170,34 +208,40 @@ class Groupe {
     REXLOG_INFO("[particules] {} threads de travail", threads_.size());
   }
 
-  void Lancer(PPCContext& ctx, uint8_t* base) {
-    {
-      std::lock_guard<std::mutex> verrou(lock_);
-      fpscr_ = ctx.fpscr;
-      suivant_.store(0, std::memory_order_relaxed);
-      ouvert_ = true;
-      tour_++;
-    }
+  // Fait les tâches 0 à nombre - 1 : faire(ctx, base, i), sur le thread appelant et les threads de travail.
+  using Faire = void (*)(PPCContext&, uint8_t*, size_t);
+  void Lancer(PPCContext& ctx, uint8_t* base, size_t nombre, Faire faire) {
+    PrendreVerrou(lock_);
+    fpscr_ = ctx.fpscr;
+    nombre_ = nombre;
+    faire_ = faire;
+    suivant_.store(0, std::memory_order_relaxed);
+    ouvert_ = true;
+    tour_++;
+    lock_.unlock();
     reveil_.notify_all();
     Prendre(ctx, base);
-    std::unique_lock<std::mutex> verrou(lock_);
+    PrendreVerrou(lock_);
     ouvert_ = false;
-    fini_.wait(verrou, [this] { return occupes_ == 0; });
-  }
-
-  static void Faire(PPCContext& ctx, uint8_t* base, Tache& t) {
-    t_tache = &t;
-    ctx.r3.u64 = t.dest;
-    ctx.f1.f64 = t.value;
-    __imp__sub_821C8A58(ctx, base);
-    t_tache = nullptr;
+    // Une aide qui finit sa dernière tâche : quelques µs d'attente active plutôt qu'un aller-retour par le noyau.
+    for (int i = 0; i < kEssaisVerrou && occupes_ != 0; i++) {
+      lock_.unlock();
+      PauseCourte();
+      PrendreVerrou(lock_);
+    }
+    if (occupes_ != 0) {
+      std::unique_lock<std::mutex> verrou(lock_, std::adopt_lock);
+      fini_.wait(verrou, [this] { return occupes_ == 0; });
+      verrou.release();
+    }
+    lock_.unlock();
   }
 
  private:
   void Prendre(PPCContext& ctx, uint8_t* base) {
-    for (size_t i = suivant_.fetch_add(1, std::memory_order_relaxed); i < g_nombre;
+    for (size_t i = suivant_.fetch_add(1, std::memory_order_relaxed); i < nombre_;
          i = suivant_.fetch_add(1, std::memory_order_relaxed)) {
-      if (!g_taches[i].annulee) Faire(ctx, base, g_taches[i]);
+      faire_(ctx, base, i);
     }
   }
 
@@ -226,8 +270,10 @@ class Groupe {
         ctx.fpscr = fpscr_;
       }
       Prendre(ctx, base);
-      std::lock_guard<std::mutex> verrou(lock_);
-      if (--occupes_ == 0) fini_.notify_one();
+      PrendreVerrou(lock_);
+      const bool dernier = --occupes_ == 0;
+      lock_.unlock();
+      if (dernier) fini_.notify_one();
     }
   }
 
@@ -236,6 +282,8 @@ class Groupe {
   std::condition_variable reveil_, fini_;
   decltype(PPCContext::fpscr) fpscr_{};
   std::atomic<size_t> suivant_{0};
+  size_t nombre_ = 0;
+  Faire faire_ = nullptr;
   uint64_t tour_ = 0;
   bool ouvert_ = false;
   int occupes_ = 0;
@@ -243,13 +291,35 @@ class Groupe {
 
 Groupe* g_groupe = nullptr;
 
+Groupe& LeGroupe() {
+  if (!g_groupe) {
+    g_groupe = new Groupe;
+    g_groupe->Demarrer(REXCVAR_GET(torchlight_particules_threads));
+  }
+  return *g_groupe;
+}
+
+void FaireMiseAJour(PPCContext& ctx, uint8_t* base, size_t i) {
+  Tache& t = g_taches[g_ordre[i]];
+  if (t.annulee) return;
+  t_tache = &t;
+  ctx.r3.u64 = t.dest;
+  ctx.f1.f64 = t.value;
+  __imp__sub_821C8A58(ctx, base);
+  t_tache = nullptr;
+}
+
 }  // namespace
 
 bool EnTache() { return t_tache != nullptr; }
 
+void EnParallele(PPCContext& ctx, uint8_t* base, size_t nombre, void (*faire)(PPCContext&, uint8_t*, size_t)) {
+  LeGroupe().Lancer(ctx, base, nombre, faire);
+}
+
 Serie::Serie() : pris_(t_tache != nullptr) {
   if (!pris_) return;
-  g_serie.lock();
+  PrendreVerrou(g_serie);
 #if !defined(__SWITCH__)
   if (t_serie++ == 0 && SuiviSerie) SuiviSerie(1);
 #else
@@ -364,23 +434,22 @@ void Executer(PPCContext& ctx, uint8_t* base) {
   if (g_nombre) {
     Cameras(ctx, base);
     const auto t0 = std::chrono::steady_clock::now();
+    g_ordre.resize(g_nombre);
+    for (size_t i = 0; i < g_nombre; i++) g_ordre[i] = uint32_t(i);
     if (Mode() == 2) {
       // Les plus coûteuses d'abord : moins d'attente de la dernière tâche à la fin (profil de la console du
-      // 2026-10-28 : 4,8 % du thread principal dans Executer en combat, sa part comprise).
-      std::stable_sort(g_taches.begin(), g_taches.begin() + g_nombre,
-                       [](const Tache& a, const Tache& b) { return a.cout > b.cout; });
-      if (!g_groupe) {
-        g_groupe = new Groupe;
-        g_groupe->Demarrer(REXCVAR_GET(torchlight_particules_threads));
-      }
-      g_groupe->Lancer(ctx, base);
+      // 2026-10-28 : 4,8 % du thread principal dans Executer en combat, sa part comprise). Sur des indices, à égalité par
+      // rang : le même ordre qu'un tri stable des tâches, sans déplacer leurs vecteurs ni allouer de tampon à chaque image.
+      std::sort(g_ordre.begin(), g_ordre.end(), [](uint32_t a, uint32_t b) {
+        return g_taches[a].cout != g_taches[b].cout ? g_taches[a].cout > g_taches[b].cout : a < b;
+      });
+      LeGroupe().Lancer(ctx, base, g_nombre, FaireMiseAJour);
     } else {
-      for (size_t i = 0; i < g_nombre; i++)
-        if (!g_taches[i].annulee) Groupe::Faire(ctx, base, g_taches[i]);
+      for (size_t i = 0; i < g_nombre; i++) FaireMiseAJour(ctx, base, i);
     }
     const auto t1 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < g_nombre; i++) {
-      for (const Differe& d : g_taches[i].differes) {
+      for (const Differe& d : g_taches[g_ordre[i]].differes) {
         ctx.r3.u64 = d.r3;
         ctx.r4.u64 = d.r4;
         ctx.r5.u64 = d.r5;
@@ -395,7 +464,197 @@ void Executer(PPCContext& ctx, uint8_t* base) {
   Rapport();
 }
 
+// --- Sommets des billboards (BillboardRenderer::_updateRenderQueue sub_821DA090, 4,1 % du thread principal en combat
+// sur la console, dont ~2,3 % pour la boucle sur les particules) ---
+//
+// Pendant le parcours de l'octree, le thread principal fait tout sauf la boucle : préparation, beginBillboards
+// (verrouillage), setVisible, mise en file (donc même ordre de la file que le jeu), statistique. Les boucles
+// (switch/tools/billboards_differes.py : texte généré recopié) sont faites à la fin du parcours, avant tout dessin,
+// puis les tampons sont déverrouillés dans l'ordre. Rien d'autre ne tourne pendant les boucles : le thread principal y
+// participe et attend la dernière.
+// Une boucle ne touche qu'à sa réserve de particules et à son BillboardSet (sommets, compteur +580, pointeur +392,
+// axes par billboard) ; caméra de ce parcours lue (cullIndividually) ; validation : mode 3 et switch/tools/suivi_memoire.
+namespace {
+
+struct Billboards {
+  uint32_t renderer, pool, set, cout;
+  uint32_t verrou = 0;             // mode 3 : pointeur de verrouillage et compteur avant la boucle
+  uint16_t compte = 0;
+  std::vector<uint8_t> resultat;  // mode 3 : sommets écrits par la boucle faite à sa place d'origine
+};
+
+std::vector<Billboards> g_bb;
+size_t g_bb_nombre = 0;
+std::vector<uint32_t> g_bb_ordre;
+bool g_bb_parcours = false;
+struct BilanBB {
+  uint64_t parcours = 0, differes = 0, refus = 0, particules = 0, comparaisons = 0, differences = 0;
+  double ms = 0;
+} g_bb_bilan;
+
+bool g_bb_actifs = true;
+
+int ModeBB() {
+  static const int mode = REXCVAR_GET(torchlight_billboards);
+  return g_bb_actifs ? mode : 0;
+}
+
+void Appeler(PPCContext& ctx, uint8_t* base, uint32_t fonction) {
+  // Fonctions attendues appelées directement, comme les appels promus du code généré.
+  switch (fonction) {
+    case 0x821E3C00: return sub_821E3C00(ctx, base);
+    case 0x821DD8A8: return sub_821DD8A8(ctx, base);
+    case 0x821A7AF0: return sub_821A7AF0(ctx, base);
+    default: return GuestFunc(fonction)(ctx, base);
+  }
+}
+
+void FaireBoucle(PPCContext& ctx, uint8_t* base, size_t i) {
+  const Billboards& b = g_bb[g_bb_ordre[i]];
+  ctx.r3.u64 = b.renderer;
+  ctx.r4.u64 = b.pool;
+#if !defined(__SWITCH__)
+  if (SuiviBillboardsTache) SuiviBillboardsTache(b.renderer, 1);
+#endif
+  torchlight_billboards_boucle(ctx, base);
+#if !defined(__SWITCH__)
+  if (SuiviBillboardsTache) SuiviBillboardsTache(b.renderer, 0);
+#endif
+}
+
+void RapportBB() {
+  static auto dernier = std::chrono::steady_clock::now();
+  const auto maintenant = std::chrono::steady_clock::now();
+  if (maintenant - dernier < std::chrono::seconds(10) || !g_bb_bilan.parcours) return;
+  dernier = maintenant;
+  const double n = double(g_bb_bilan.parcours);
+  if (torchlight::coeurs::JournalStats()) REXLOG_INFO("[billboards] par parcours : {:.1f} boucles différées ({:.0f} particules), {:.1f} refusées, {:.3f} ms ; "
+              "validation : {} comparées, {} différentes",
+              g_bb_bilan.differes / n, g_bb_bilan.particules / n, g_bb_bilan.refus / n, g_bb_bilan.ms / n,
+              g_bb_bilan.comparaisons, g_bb_bilan.differences);
+  g_bb_bilan = BilanBB{};
+}
+
+}  // namespace
+
+void BillboardsActifs(bool actifs) { g_bb_actifs = actifs; }
+
+void BillboardsDebut(PPCContext& ctx, uint8_t* base) {
+  g_bb_parcours = ModeBB() != 0;
+#if !defined(__SWITCH__)
+  if (g_bb_parcours && SuiviBillboardsParcours) SuiviBillboardsParcours(ctx, base, 1);
+#else
+  (void)ctx;
+  (void)base;
+#endif
+}
+
+void BillboardsFin(PPCContext& ctx, uint8_t* base) {
+  g_bb_parcours = false;
+  if (!ModeBB()) return;
+#if !defined(__SWITCH__)
+  struct FinSuivi {
+    PPCContext& ctx;
+    uint8_t* base;
+    ~FinSuivi() {
+      if (SuiviBillboardsParcours) SuiviBillboardsParcours(ctx, base, 0);
+    }
+  } fin_suivi{ctx, base};
+#endif
+  g_bb_bilan.parcours++;
+  if (g_bb_nombre) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t ancien = ctx.r1.u32, sp = ancien - 256;
+    std::memset(base + sp, 0, 16);
+    ctx.r1.u64 = sp;
+    g_bb_ordre.resize(g_bb_nombre);
+    for (size_t i = 0; i < g_bb_nombre; i++) g_bb_ordre[i] = uint32_t(i);
+    if (ModeBB() == 2) {
+      // Les plus longues d'abord : moins d'attente de la dernière.
+      std::stable_sort(g_bb_ordre.begin(), g_bb_ordre.end(),
+                       [](uint32_t a, uint32_t b) { return g_bb[a].cout > g_bb[b].cout; });
+      LeGroupe().Lancer(ctx, base, g_bb_nombre, FaireBoucle);
+    } else {
+      for (size_t i = 0; i < g_bb_nombre; i++) {
+        FaireBoucle(ctx, base, i);
+        if (ModeBB() != 3) continue;
+        const Billboards& b = g_bb[i];
+        const uint32_t fin = Load32(base, b.set + 392);
+        g_bb_bilan.comparaisons++;
+        if (fin - b.verrou != b.resultat.size() ||
+            std::memcmp(base + b.verrou, b.resultat.data(), b.resultat.size()) != 0) {
+          if (g_bb_bilan.differences++ < 8)
+            REXLOG_ERROR("[billboards] différence : renderer {:08X}, {} octets contre {}", b.renderer, fin - b.verrou,
+                         b.resultat.size());
+        }
+      }
+    }
+    // Déverrouillage (case 20 du tampon +380), comme la suite de la boucle, dans l'ordre d'origine.
+    for (size_t i = 0; i < g_bb_nombre; i++) {
+      const uint32_t tampon = Load32(base, g_bb[i].set + 380);
+      ctx.r3.u64 = tampon;
+      Appeler(ctx, base, Load32(base, Load32(base, tampon) + 20));
+    }
+    ctx.r1.u64 = ancien;
+    g_bb_nombre = 0;
+    g_bb_bilan.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  }
+  RapportBB();
+}
+
 }  // namespace torchlight::particules
+
+// Appelée par sub_821DA090 juste après beginBillboards (switch/tools/billboards_differes.py). Vrai : boucle mise de
+// côté et suite de la fonction faite ici, sauf le déverrouillage ; le jeu saute à sa sortie.
+extern "C" bool torchlight_billboards_differer(PPCContext& ctx, uint8_t* base, uint32_t renderer, uint32_t queue,
+                                               uint32_t pool) {
+  using namespace torchlight::particules;
+  if (!g_bb_parcours) return false;
+  const uint32_t set = Load32(base, renderer + 120);
+  // Particule inexistante (liste vide) : le jeu ne met rien en file. Données propres du BillboardSet (+588 nul) :
+  // _updateRenderQueue remplirait le tampon lui-même.
+  const uint32_t tete = Load32(base, pool + 20);
+  if (Load32(base, tete) == tete || !base[set + 588]) {
+    g_bb_bilan.refus++;
+    return false;
+  }
+  if (g_bb_nombre == g_bb.size()) g_bb.emplace_back();
+  Billboards& b = g_bb[g_bb_nombre++];
+  b.renderer = renderer;
+  b.pool = pool;
+  b.set = set;
+  b.cout = Load32(base, pool + 24);
+  g_bb_bilan.differes++;
+#if !defined(__SWITCH__)
+  if (SuiviBillboardsPoste) SuiviBillboardsPoste(renderer);
+#endif
+  g_bb_bilan.particules += b.cout;
+  if (ModeBB() == 3) {
+    // Boucle faite ici aussi, à sa place d'origine ; sommets gardés pour la comparaison, état remis.
+    b.verrou = Load32(base, set + 392);
+    b.compte = uint16_t(base[set + 580]) << 8 | base[set + 581];
+    ctx.r3.u64 = renderer;
+    ctx.r4.u64 = pool;
+    torchlight_billboards_boucle(ctx, base);
+    const uint32_t fin = Load32(base, set + 392);
+    b.resultat.assign(base + b.verrou, base + fin);
+    const uint32_t verrou_be = __builtin_bswap32(b.verrou);
+    std::memcpy(base + set + 392, &verrou_be, 4);
+    base[set + 580] = uint8_t(b.compte >> 8);
+    base[set + 581] = uint8_t(b.compte);
+  }
+  // setVisible(true), _updateRenderQueue(queue), statistique du gestionnaire (+200) : la fin de sub_821DA090.
+  ctx.r3.u64 = set;
+  ctx.r4.u64 = 1;
+  Appeler(ctx, base, Load32(base, Load32(base, set) + 96));
+  ctx.r3.u64 = set;
+  ctx.r4.u64 = queue;
+  Appeler(ctx, base, Load32(base, Load32(base, set) + 92));
+  const uint32_t gestionnaire = Load32(base, 0x83506798);
+  const uint32_t total = __builtin_bswap32(Load32(base, gestionnaire + 200) + Load32(base, pool + 24));
+  std::memcpy(base + gestionnaire + 200, &total, 4);
+  return true;
+}
 
 using torchlight::particules::Serie;
 

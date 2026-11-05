@@ -36,13 +36,15 @@ struct VertexElement {
 
 // Tampon de sommets tel qu'en mémoire du jeu (big-endian). Seule la plage du dessin est lue et convertie,
 // à chaque dessin : le jeu réécrit certains tampons au même endroit au cours d'une image (interface CEGUI).
-// id : identité du tampon (adresse), pour les relevés.
+// id : identité du tampon (adresse), pour les relevés. version : 0, ou numéro unique d'un contenu qui ne changera plus
+// (géométrie inchangée d'une image à l'autre) : le rendu garde sa conversion et ne relit plus data.
 struct VertexStream {
   uint32_t source = 0;
   const uint8_t* data = nullptr;
   size_t size = 0;
   uint32_t stride = 0;
   uint64_t id = 0;
+  uint64_t version = 0;
 };
 
 struct IndexStream {
@@ -50,6 +52,7 @@ struct IndexStream {
   size_t size = 0;
   uint32_t index_size = 2;
   uint64_t id = 0;
+  uint64_t version = 0;
 };
 
 // Texture : key identifie le contenu (adresse, format, taille, empreinte des données). load n'est appelé
@@ -173,6 +176,10 @@ struct Stats {
   double ms_vertices = 0, ms_constants = 0, ms_descriptors = 0, ms_textures = 0;  // parties de Draw
   double ms_pipelines = 0;  // dont création de pipelines (vkCreateGraphicsPipelines)
   uint64_t upload_bytes = 0;
+  // Géométrie persistante : octets servis sans conversion, écrits en mémoire persistante (comptés aussi dans
+  // upload_bytes), plages revérifiées et différentes, entrées et arènes en service.
+  uint64_t geometry_served = 0, geometry_written = 0, geometry_checked = 0, geometry_differences = 0;
+  uint64_t geometry_entries = 0, geometry_arenas = 0, geometry_recycled = 0;
 };
 
 class Renderer {
@@ -209,6 +216,9 @@ class Renderer {
 
   virtual const Stats& stats() const = 0;
   virtual void ResetStats() = 0;
+
+  // Essai : une géométrie persistante sur « every » est reconvertie et comparée à ce qui est gardé (0 : jamais).
+  virtual void SetGeometryCheck(uint32_t every) { (void)every; }
 };
 
 }  // namespace torchlight::natif

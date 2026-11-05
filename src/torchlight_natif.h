@@ -56,6 +56,14 @@ void ShaderSource(uint64_t hash, const std::string& profile, const std::string& 
 void RunInBackground(std::function<void()> task);
 
 // Mêmes événements que torchlight::capture (voir torchlight_capture.h).
+// Essai : tampons du relevé recyclés (vrai, défaut) ou alloués à chaque copie (src/torchlight_coeurs.cpp).
+void RecyclageActif(bool actif);
+// Essai : le thread de rendu traite les images relevées (vrai, défaut) ou les jette, sans conversion, envoi ni travail du
+// GPU, écran figé (src/torchlight_coeurs.cpp) : gain maximal du thread principal si le rendu ne gênait plus sa mémoire.
+void VulkanActif(bool actif);
+// Essai : géométrie inchangée gardée en mémoire du GPU (vrai, défaut) ou renvoyée à chaque image (src/torchlight_coeurs.cpp).
+void GeometrieActive(bool active);
+
 void BeginGameFrame();
 void EndGameFrame();
 void BeginFrame();

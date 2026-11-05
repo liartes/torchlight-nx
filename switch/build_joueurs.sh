@@ -17,7 +17,7 @@ if [ -d "$ROOT/pgo" ] && [ -d "$OUT/CMakeFiles" ]; then
         -delete 2>/dev/null || true
 fi
 OUT="$OUT" CMAKE_OPTIONS="-DTORCHLIGHT_LTO=ON -DTORCHLIGHT_PILE_NON_VOLATILE=ON -DTORCHLIGHT_PGO=utiliser \
--DTORCHLIGHT_OUTILS=OFF" "$HERE/build_switch.sh"
+-DTORCHLIGHT_OUTILS=OFF -DTORCHLIGHT_MESURE_TLB=OFF" "$HERE/build_switch.sh"
 
 VERSION=$(sed -n 's/^set(TORCHLIGHT_VERSION "\(.*\)")$/\1/p' "$HERE/CMakeLists.txt")
 [ -n "$VERSION" ] || { echo "TORCHLIGHT_VERSION introuvable dans switch/CMakeLists.txt" >&2; exit 1; }

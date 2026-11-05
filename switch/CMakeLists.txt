@@ -14,7 +14,7 @@ project(torchlight LANGUAGES CXX)
 
 # Nom public du projet : torchlight-nx (portage non officiel ; menu homebrew, zip des joueurs). Version affichée par
 # le menu homebrew et nom du zip (switch/build_joueurs.sh).
-set(TORCHLIGHT_VERSION "1.0.4")
+set(TORCHLIGHT_VERSION "1.0.5")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +34,7 @@ include(generated/rexglue.cmake)
 
 add_executable(torchlight ../src/main.cpp ../src/torchlight_trace.cpp ../src/torchlight_manette.cpp
     ../src/torchlight_capture.cpp ../src/torchlight_natif.cpp ../src/torchlight_crt.cpp ../src/torchlight_ogre_natif.cpp ../src/torchlight_blocs.cpp ../src/torchlight_pgo.cpp ../src/natif/rendu.cpp
-    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp ../src/torchlight_particules.cpp ../src/torchlight_boost.cpp
+    ../src/natif/hlsl_prep.cpp ../src/natif/hlsl_compiler.cpp ../src/natif/d3dx_cache.cpp ../src/torchlight_installation.cpp ../src/torchlight_menu_fond.cpp ../src/torchlight_appels_indirects.cpp ../src/torchlight_particules.cpp ../src/torchlight_boost.cpp ../src/torchlight_coeurs.cpp ../src/torchlight_poses.cpp
     ${REXSDK_DIR}/thirdparty/glslang/StandAlone/ResourceLimits.cpp)
 target_include_directories(torchlight PRIVATE ../src)
 # Rendu natif : empreintes des textures avec XXH3 (rex/hash.h), en-tête du SDK non exporté par ses cibles.
@@ -57,6 +57,31 @@ target_compile_definitions(torchlight PRIVATE TORCHLIGHT_NATIF=1)
 option(TORCHLIGHT_OUTILS "Outils de développement (manette de script, capture d'écran)" ON)
 if(TORCHLIGHT_OUTILS)
     target_compile_definitions(torchlight PRIVATE TORCHLIGHT_OUTILS=1)
+endif()
+
+# Mesure du coût des défauts de TLB sur la console (src/torchlight_tlb.cpp) : essai, jamais dans une build des joueurs.
+option(TORCHLIGHT_MESURE_TLB "Mesure du coût des défauts de TLB (essai)" OFF)
+if(TORCHLIGHT_MESURE_TLB AND REXGLUE_PLATFORM_SWITCH)
+    target_sources(torchlight PRIVATE ../src/torchlight_tlb.cpp)
+endif()
+
+# Décompression des fichiers du jeu par la zlib de l'hôte et lectures du zip en tampon (src/torchlight_inflate.cpp),
+# primitives du chargement des données en natif (src/torchlight_donnees_natif.cpp).
+target_sources(torchlight PRIVATE ../src/torchlight_inflate.cpp ../src/torchlight_donnees_natif.cpp)
+target_link_libraries(torchlight PRIVATE z)
+
+# Code du .nro reprojeté en blocs de 2 Mo au démarrage (src/torchlight_code_blocs.cpp). Sans LTO : assembleur de premier niveau.
+option(TORCHLIGHT_CODE_BLOCS "Code du .nro reprojeté en blocs de 2 Mo au démarrage" ON)
+if(TORCHLIGHT_CODE_BLOCS AND REXGLUE_PLATFORM_SWITCH)
+    target_sources(torchlight PRIVATE ../src/torchlight_code_blocs.cpp)
+    set_source_files_properties(../src/torchlight_code_blocs.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
+
+# Natives du thread principal actives à la compilation, sans alternance ni validation (src/torchlight_ogre_natif.cpp).
+# Change le code de ces fonctions : le profil PGO doit avoir été relevé avec la même valeur. OFF pour un A/B sur la console.
+option(TORCHLIGHT_NATIVES_FIXES "Natives du thread principal sans alternance ni validation (Switch)" ON)
+if(TORCHLIGHT_NATIVES_FIXES AND REXGLUE_PLATFORM_SWITCH)
+    target_compile_definitions(torchlight PRIVATE TORCHLIGHT_NATIVES_FIXES=1)
 endif()
 
 # Build PC (switch/out-pc, pour développer le rendu natif) avec le SDK en sous-dossier :

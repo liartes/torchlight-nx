@@ -1,15 +1,39 @@
 #!/usr/bin/env python3
-"""Arbre de la build PC de suivi mémoire des particules (diagnostic, jamais versionné).
+"""Arbre de la build PC de suivi mémoire (diagnostic, jamais versionné).
 
-preparer.py <dépôt torchlight> <dossier de sortie>
+preparer.py <dépôt torchlight> <dossier de sortie> [poses|billboards]
   <sortie>/src -> lien vers <dépôt>/src ; <sortie>/switch : liens vers switch/* sauf generated (copie modifiée) et
   CMakeLists.txt (copie + suivi_particules.cpp).
-Code généré : accès mémoire instrumentés (pch), REX_RAW_ADDR classés lecture/écriture d'après l'instruction,
-mises à jour des systèmes de ParticleUniverse encadrées dans sub_821C8A58.
+Code généré : accès mémoire instrumentés (pch), REX_RAW_ADDR classés lecture/écriture d'après l'instruction.
+Par défaut : mises à jour des systèmes de ParticleUniverse encadrées dans sub_821C8A58 (suivi_particules.cpp).
+poses : Entity::cacheBoneMatrices et les étapes de l'image encadrées, thread principal entier suivi (suivi_poses.cpp).
+billboards : aucune garde (src/torchlight_particules.cpp appelle les symboles faibles de suivi_billboards.cpp).
 """
 import os, re, shutil, sys
 
 DEPOT, SORTIE = map(os.path.abspath, sys.argv[1:3])
+MODE = sys.argv[3] if len(sys.argv) > 3 else 'particules'
+SOURCE = {'particules': 'suivi_particules.cpp', 'poses': 'suivi_poses.cpp', 'billboards': 'suivi_billboards.cpp'}[MODE]
+# Mode poses : gardes en tête de fonction (tous les chemins d'entrée, directs, indirects, branches de fin).
+ETAPES = {'sub_821E5910': 1, 'sub_821E6BD8': 2, 'sub_8219D288': 3, 'sub_821B07F0': 4, 'sub_821C8C00': 5,
+          'sub_821A6070': 6, 'sub_821F26B0': 7}
+GARDES_DECL = (
+    'extern "C" int SuiviEtapeEntree(PPCContext& ctx, uint8_t* base, int etape) noexcept;\n'
+    'extern "C" void SuiviEtapeSortie(int avant) noexcept;\n'
+    'extern "C" void SuiviPoseEntree(PPCContext& ctx, uint8_t* base) noexcept;\n'
+    'extern "C" void SuiviPoseSortie() noexcept;\n'
+    'extern "C" void SuiviBbEntree() noexcept;\n'
+    'extern "C" void SuiviBbSortie() noexcept;\n'
+    'extern "C" unsigned SuiviUniteEntree(unsigned unite) noexcept;\n'
+    'extern "C" void SuiviUniteSortie(unsigned avant) noexcept;\n'
+    'extern "C" void SuiviRendue(unsigned entite) noexcept;\n'
+    'namespace { struct SuiviEtapeGarde { int a; SuiviEtapeGarde(PPCContext& c, uint8_t* b, int e) : '
+    'a(SuiviEtapeEntree(c, b, e)) {} ~SuiviEtapeGarde() { SuiviEtapeSortie(a); } };\n'
+    'struct SuiviPoseGarde { SuiviPoseGarde(PPCContext& c, uint8_t* b) { SuiviPoseEntree(c, b); } '
+    '~SuiviPoseGarde() { SuiviPoseSortie(); } };\n'
+    'struct SuiviBbGarde { SuiviBbGarde() { SuiviBbEntree(); } ~SuiviBbGarde() { SuiviBbSortie(); } };\n'
+    'struct SuiviUniteGarde { unsigned a; explicit SuiviUniteGarde(unsigned u) : a(SuiviUniteEntree(u)) {} '
+    '~SuiviUniteGarde() { SuiviUniteSortie(a); } }; }\n')
 ICI = os.path.dirname(os.path.abspath(__file__))
 SW = os.path.join(SORTIE, 'switch')
 os.makedirs(SW, exist_ok=True)
@@ -28,8 +52,8 @@ for nom in os.listdir(os.path.join(DEPOT, 'switch')):
 
 cm = open(os.path.join(DEPOT, 'switch', 'CMakeLists.txt')).read()
 cm = cm.replace('../src/torchlight_appels_indirects.cpp',
-                '../src/torchlight_appels_indirects.cpp ' + os.path.join(ICI, "suivi_particules.cpp"), 1)
-assert 'suivi_particules.cpp' in cm
+                '../src/torchlight_appels_indirects.cpp ' + os.path.join(ICI, SOURCE), 1)
+assert SOURCE in cm
 open(os.path.join(SW, 'CMakeLists.txt'), 'w').write(cm)
 
 SRC_GEN = os.path.join(DEPOT, 'switch', 'generated')
@@ -61,15 +85,15 @@ extern "C" void SuiviAlloc(unsigned adresse, unsigned taille) noexcept;
 #undef REX_STORE_U16
 #undef REX_STORE_U32
 #undef REX_STORE_U64
-#define REX_LOAD_U8(x) (SUIVI_A((x), 1, 0), (*(volatile u8*)(base + (u32)(x))))
-#define REX_LOAD_U16(x) (SUIVI_A((x), 2, 0), __builtin_bswap16(*(volatile u16*)(base + (u32)(x))))
-#define REX_LOAD_U32(x) (SUIVI_A((x), 4, 0), __builtin_bswap32(*(volatile u32*)(base + (u32)(x))))
-#define REX_LOAD_U64(x) (SUIVI_A((x), 8, 0), __builtin_bswap64(*(volatile u64*)(base + (u32)(x))))
+#define REX_LOAD_U8(x) (SUIVI_A((x), 1, 0), (*(volatile u8*)REX_RAW_ADDR(x)))
+#define REX_LOAD_U16(x) (SUIVI_A((x), 2, 0), __builtin_bswap16(*(volatile u16*)REX_RAW_ADDR(x)))
+#define REX_LOAD_U32(x) (SUIVI_A((x), 4, 0), __builtin_bswap32(*(volatile u32*)REX_RAW_ADDR(x)))
+#define REX_LOAD_U64(x) (SUIVI_A((x), 8, 0), __builtin_bswap64(*(volatile u64*)REX_RAW_ADDR(x)))
 #define SUIVI_S(x, n, y) (t_suivi_actif ? SuiviEcriture((u32)(x), (n), (unsigned long long)(y), __func__) : (void)0)
-#define REX_STORE_U8(x, y) (SUIVI_S((x), 1, (y)), (void)(*(volatile u8*)(base + (u32)(x)) = (y)))
-#define REX_STORE_U16(x, y) (SUIVI_S((x), 2, (y)), (void)(*(volatile u16*)(base + (u32)(x)) = __builtin_bswap16(y)))
-#define REX_STORE_U32(x, y) (SUIVI_S((x), 4, (y)), (void)(*(volatile u32*)(base + (u32)(x)) = __builtin_bswap32(y)))
-#define REX_STORE_U64(x, y) (SUIVI_S((x), 8, (y)), (void)(*(volatile u64*)(base + (u32)(x)) = __builtin_bswap64(y)))
+#define REX_STORE_U8(x, y) (SUIVI_S((x), 1, (y)), (void)(*(volatile u8*)REX_RAW_ADDR(x) = (y)))
+#define REX_STORE_U16(x, y) (SUIVI_S((x), 2, (y)), (void)(*(volatile u16*)REX_RAW_ADDR(x) = __builtin_bswap16(y)))
+#define REX_STORE_U32(x, y) (SUIVI_S((x), 4, (y)), (void)(*(volatile u32*)REX_RAW_ADDR(x) = __builtin_bswap32(y)))
+#define REX_STORE_U64(x, y) (SUIVI_S((x), 8, (y)), (void)(*(volatile u64*)REX_RAW_ADDR(x) = __builtin_bswap64(y)))
 #define REX_RAW_ADDR_L16(x) (SUIVI_A((x), 16, 0), REX_RAW_ADDR(x))
 #define REX_RAW_ADDR_E16(x) (SUIVI_A((x), 16, 1), REX_RAW_ADDR(x))
 #define REX_RAW_ADDR_E8(x) (SUIVI_A((x), 8, 1), REX_RAW_ADDR(x))
@@ -95,9 +119,29 @@ for nom in sorted(os.listdir(G)):
     dernier = None
     modif = False
     dans_8a58 = False
+    garde = None
+    gardes_fichier = False
     for i, l in enumerate(lignes):
         if l.startswith('DEFINE_REX_FUNC('):
-            dans_8a58 = l.startswith('DEFINE_REX_FUNC(sub_821C8A58)')
+            dans_8a58 = MODE == 'particules' and l.startswith('DEFINE_REX_FUNC(sub_821C8A58)')
+            if MODE == 'poses':
+                f = l[len('DEFINE_REX_FUNC('):].split(')')[0]
+                if f == 'sub_821B93B0':
+                    garde = 'SuiviPoseGarde suivi_garde(ctx, base);'
+                elif f == 'sub_821BB578':
+                    garde = 'SuiviBbGarde suivi_garde;'
+                elif f == 'sub_821D5410':
+                    garde = 'SuiviUniteGarde suivi_garde(ctx.r3.u32);'
+                elif f == 'sub_821E0D18':
+                    garde = 'SuiviRendue(ctx.r3.u32);'
+                elif f in ETAPES:
+                    garde = 'SuiviEtapeGarde suivi_garde(ctx, base, %d);' % ETAPES[f]
+        if garde and l.strip() == 'REX_FUNC_PROLOGUE();':
+            lignes[i] = l + ' ' + garde
+            garde = None
+            gardes_fichier = True
+            encadres += 1
+            modif = True
         m = re_asm.match(l)
         if m:
             dernier = m.group(1)
@@ -128,6 +172,9 @@ for nom in sorted(os.listdir(G)):
                 encadres += 1
                 modif = True
     if modif:
+        if gardes_fichier:
+            k = next(j for j, x in enumerate(lignes) if x.startswith('DEFINE_REX_FUNC('))
+            lignes.insert(k, GARDES_DECL)
         if any('SuiviDebut' in x for x in lignes):
             k = next(j for j, x in enumerate(lignes) if x.startswith('DEFINE_REX_FUNC('))
             lignes.insert(k, 'extern "C" void SuiviDebut(PPCContext& ctx, uint8_t* base, unsigned sys) noexcept;\n'

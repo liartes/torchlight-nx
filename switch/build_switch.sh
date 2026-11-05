@@ -69,6 +69,12 @@ python3 "$HERE/tools/retour_sans_lr.py"
 # rlwinm / rlwimi en décalages et extractions simples (switch/tools/decalages_rlwinm.py, exact : test
 # switch/tools/test_decalages_rlwinm.py) : en dernier.
 python3 "$HERE/tools/decalages_rlwinm.py"
+# Opérations atomiques du jeu sans le verrou global de l'hôte (switch/tools/atomiques_sans_verrou.py) : le compare-and-swap
+# suffit, les sections ne contiennent rien d'autre. Après les registres locaux, qui renomment ces lignes.
+python3 "$HERE/tools/atomiques_sans_verrou.py"
+# Boucle des particules de BillboardRenderer::_updateRenderQueue séparable (switch/tools/billboards_differes.py) : après
+# toutes les autres étapes, elle en recopie le texte final.
+python3 "$HERE/tools/billboards_differes.py"
 # Mémoire du jeu sans volatile (switch/tools/memoire_non_volatile.py) : essayée le 2026-11-01, pas de gain sur la
 # console (ville ~2 % plus lente) ; étape retirée, outil gardé (à relancer en dernier, avec
 # -DTORCHLIGHT_MEMOIRE_NON_VOLATILE=ON, puis switch/tools/boucles_infinies.py sur l'ELF).

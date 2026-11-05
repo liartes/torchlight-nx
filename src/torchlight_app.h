@@ -151,6 +151,10 @@ class TorchlightApp : public rex::ReXApp {
     SetDefault("torchlight_natif", "true");
     SetDefault("torchlight_natif_seul", "true");
     SetDefault("mesa_env", "NVK_SWITCH_ZCULL=0");
+    SetDefault("torchlight_coeur_principal", "2");
+    SetDefault("torchlight_billboards", "2");
+    SetDefault("torchlight_poses", "2");
+    SetDefault("torchlight_poses_double", "true");
     SetDefault("nfsmw_io_ventana_kb", "0");
     SetDefault("nfsmw_io_cache_mb", "64");
     SetDefault("nfsmw_io_cache_bloque_kb", "64");

@@ -35,6 +35,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 
+#include "torchlight_coeurs.h"
 #include "torchlight_invite.h"
 #include "torchlight_natif.h"
 
@@ -362,7 +363,7 @@ bool Outside(const uint8_t* base, uint32_t bucket) {
 void Report() {
   if (g_stats.walks % 600 != 0) return;
   const double w = double(g_stats.walks);
-  REXLOG_INFO("[blocs] par parcours de la caméra principale (600 parcours) : {:.1f} blocs testés, {:.1f} {}, {:.1f} "
+  if (torchlight::coeurs::JournalStats()) REXLOG_INFO("[blocs] par parcours de la caméra principale (600 parcours) : {:.1f} blocs testés, {:.1f} {}, {:.1f} "
               "illisibles ; {} formes construites ({} morceaux), {} en mémoire{}",
               g_stats.tested / w, g_stats.dropped / w, g_mode == 2 ? "à retirer (validation)" : "retirés",
               g_stats.unreadable / w, g_stats.shapes, g_stats.pieces, g_shapes.size(),

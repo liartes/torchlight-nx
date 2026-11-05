@@ -37,6 +37,7 @@
 #include <rex/system/xmemory.h>
 
 #include "torchlight_capture.h"
+#include "torchlight_coeurs.h"
 #include "natif/d3dx_cache.h"
 #include "natif/hlsl_prep.h"
 #include "torchlight_invite.h"
@@ -850,7 +851,15 @@ void CountSlot(int slot) {
 // Méthodes de Ogre::D3D9RenderSystem (cases de switch/ogre/D3D9RenderSystem.txt). TL_TRACE_D3D : l'original ne fait
 // que transmettre un état au Direct3D du jeu (vérifié dans Ogre 1.7 et dans le portage Xbox : aucune écriture hors
 // de sa pile ; profondeur, couleurs, scissor, effacement, déclaration de sommets ajoutés le 2026-10-02).
-TL_TRACE(821C8E40, kSetTexture)                // case 39 (surcharge TexturePtr ; 38 = surcharge String)
+// case 39 (surcharge TexturePtr ; 38 = surcharge String) : corps natif dans src/torchlight_ogre_natif.cpp
+namespace torchlight::ogre {
+void SetTexture(PPCContext& ctx, uint8_t* base);
+void SetTextureUnitSettings(PPCContext& ctx, uint8_t* base);
+}
+REX_HOOK_RAW(sub_821C8E40) {
+  torchlight::trace::Enter(torchlight::trace::kSetTexture, ctx, base);
+  torchlight::ogre::SetTexture(ctx, base);
+}
 TL_TRACE_D3D(821C52B0, kSetSceneBlending)          // case 51
 TL_TRACE(821AE5A8, kBeginFrame)                // case 55
 TL_TRACE(821B1000, kEndFrame)                  // case 58
@@ -858,7 +867,14 @@ TL_TRACE(821A4368, kSetViewport)               // case 59
 TL_TRACE(821C6CF8, kSetCullingMode)            // case 61
 TL_TRACE_D3D(821BE2F8, kSetDepthBufferParams)      // case 63
 TL_TRACE_D3D(821CE5A0, kSetVertexDeclaration)      // case 84
-TL_TRACE(821C3E78, kSetVertexBufferBinding)    // case 85
+// case 85 : corps natif dans src/torchlight_ogre_natif.cpp
+namespace torchlight::ogre {
+void SetVertexBufferBinding(PPCContext& ctx, uint8_t* base);
+}
+REX_HOOK_RAW(sub_821C3E78) {
+  torchlight::trace::Enter(torchlight::trace::kSetVertexBufferBinding, ctx, base);
+  torchlight::ogre::SetVertexBufferBinding(ctx, base);
+}
 TL_TRACE(821C1398, kBindGpuProgram)            // case 90
 TL_TRACE_D3D(8219CAF8, kClearFrameBuffer)          // case 107
 TL_TRACE(821A7620, kSetRenderTarget)           // case 114
@@ -1013,6 +1029,16 @@ REX_HOOK_RAW(sub_821A5C10) {
     sub_821F2910(c, base);
     torchlight::trace::t_lock_no_wait = true;
   }
+}
+// Un tour de l'attente du GPU par le Direct3D du jeu (fence, place dans l'anneau de commandes). L'original commence par
+// une pause (db16cyc : cède le cœur à l'autre fil matériel de la Xbox 360) qui ne fait plus rien une fois recompilée. Au
+// plafond de 60 images/s, le thread principal tournait donc à vide : 17,85 % de son temps dans la mine (relevé du
+// 2026-11-04, sub_821F31C8 -> sub_821A5C10), et un cœur affiché à 100 %. Vraie pause à la place ; boucle, envoi au GPU et
+// détection de blocage (5 s) restent ceux du jeu. --torchlight_attente_dort : vrai par défaut.
+REX_EXTERN(__imp__sub_82774170);
+REX_HOOK_RAW(sub_82774170) {
+  torchlight::coeurs::PauseAttenteGpu();
+  __imp__sub_82774170(ctx, base);
 }
 
 // bindGpuProgramParameters (case 91). Gardé : copie des paramètres partagés (_copySharedParams, lus ensuite par le
@@ -1214,6 +1240,10 @@ REX_HOOK_RAW(sub_82778058) {
 
 REX_EXTERN(__imp__sub_82777F10);
 REX_HOOK_RAW(sub_82777F10) {
+  struct ChronoD3dx {
+    uint64_t debut = torchlight::coeurs::ChronoD3dxDebut();
+    ~ChronoD3dx() { torchlight::coeurs::ChronoD3dxFin(debut); }
+  } chrono_d3dx;
   using namespace torchlight::trace;
   DumpHlsl(ctx, base);
   const auto t0 = std::chrono::steady_clock::now();
@@ -1267,7 +1297,7 @@ REX_HOOK_RAW(sub_82777F10) {
   }
   g_d3dx_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   if ((++g_d3dx_calls % 25) == 0)
-    REXLOG_INFO("[natif] D3DXCompileShader : {} appels ({} allégés, {} du cache), {:.0f} ms au total, {:.1f} ms en "
+    if (torchlight::coeurs::JournalStats()) REXLOG_INFO("[natif] D3DXCompileShader : {} appels ({} allégés, {} du cache), {:.0f} ms au total, {:.1f} ms en "
                 "moyenne ; cache : {}",
                 g_d3dx_calls, g_d3dx_stubs, g_d3dx_cached, g_d3dx_ms, g_d3dx_ms / g_d3dx_calls,
                 torchlight::natif::d3dx::Summary());
@@ -1316,7 +1346,11 @@ TL_SLOT(82572938, 25)  // getErrorDescription
 TL_SLOT(82572A50, 26)  // _useLights
 // case 27 (areFixedFunctionLightsInViewSpace) : sub_828AD748, fonction partagée avec le reste du jeu (pas de compteur)
 TL_SLOT(824C3CB8, 29)  // _setWorldMatrices
-TL_SLOT(821C93A0, 32)  // _setTextureUnitSettings
+// _setTextureUnitSettings : corps natif dans src/torchlight_ogre_natif.cpp
+REX_HOOK_RAW(sub_821C93A0) {
+  torchlight::trace::CountSlot(32);
+  torchlight::ogre::SetTextureUnitSettings(ctx, base);
+}
 TL_SLOT_D3D(821D2530, 36)  // _setPointSpritesEnabled (__SetRenderState seulement)
 TL_SLOT_D3D(821C56A0, 37)  // _setPointParameters
 TL_SLOT(824C39D8, 38)  // _setTexture

@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
+#include <iterator>
+#include <unordered_map>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -495,6 +498,11 @@ std::string HashName(uint64_t h) {
 
 constexpr int kSlots = 2;                         // images en vol
 constexpr VkDeviceSize kChunkSize = 64ull << 20;  // tampon d'envoi (sommets, indices, constantes, textures)
+// Géométrie persistante : 98-99 % de ce qui était converti et envoyé à chaque image (4 à 10 Mo, plusieurs fois le cache L2
+// de 2 Mo partagé avec le thread du jeu) n'avait pas changé. Arènes écrites à la suite ; la plus ancienne est reprise
+// quand toutes sont pleines ; ce qui est encore utile y revient de soi-même. Si rien n'est libre : tampon de l'image.
+constexpr VkDeviceSize kGeomArena = 32ull << 20;
+constexpr size_t kGeomArenas = 3;
 constexpr uint32_t kSetsPerPool = 4096;
 constexpr uint64_t kTextureIdleFrames = 600;      // texture inutilisée depuis ce nombre d'images : libérée
 constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -527,6 +535,31 @@ struct TextureEntry {
   Image image;  // image.image nul : texture inutilisable (format...)
   bool cube = false;
   uint64_t last_used = 0;
+};
+
+// Clé d'une géométrie persistante : version du contenu, forme de la conversion (taille d'indice, ou pas et plan des
+// sommets), taille.
+struct GeomKey {
+  uint64_t version;
+  uint32_t form;
+  uint32_t bytes;
+  bool operator==(const GeomKey& o) const { return version == o.version && form == o.form && bytes == o.bytes; }
+};
+struct GeomKeyHash {
+  size_t operator()(const GeomKey& k) const {
+    return size_t((k.version * 0x9E3779B97F4A7C15ull) ^ (uint64_t(k.form) << 32 | k.bytes));
+  }
+};
+struct GeomEntry {
+  VkBuffer buffer;
+  VkDeviceSize offset;
+  const uint8_t* data;
+  uint32_t max_index;
+  uint32_t arena;
+};
+struct GeomArena {
+  Buffer buffer;
+  uint64_t free_at = 0;  // reprise en cours : ses plages sont sorties de la table, libre à partir de cette image
 };
 
 struct Slot {
@@ -684,6 +717,8 @@ class RendererImpl final : public Renderer {
     for (VkDescriptorPool p : s.pools) vk_.vkResetDescriptorPool(dev_, p, 0);
     s.pool = 0;
     frame_++;
+    stats_.geometry_entries = geom_.size();
+    stats_.geometry_arenas = arenas_.size();
     EvictTextures();
 
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -765,27 +800,47 @@ class RendererImpl final : public Renderer {
         return Skip("plage d'indices hors du tampon (début " + std::to_string(d.istart) + ", nombre " +
                     std::to_string(d.icount) + ", taille " + std::to_string(isize) + ", tampon " +
                     std::to_string(d.index.size) + " octets)");
-      scratch_.resize(bytes);
-      uint32_t max_index = 0;
-      if (isize == 2) {
-        const uint16_t* src = reinterpret_cast<const uint16_t*>(d.index.data + first);
-        uint16_t* dst = reinterpret_cast<uint16_t*>(scratch_.data());
-        for (size_t k = 0; k < d.icount; k++) {
-          const uint16_t v = __builtin_bswap16(src[k]);
-          dst[k] = v;
-          max_index = std::max<uint32_t>(max_index, v);
-        }
+      const GeomKey key{d.index.version, uint32_t(isize), uint32_t(bytes)};
+      const GeomEntry* kept = d.index.version ? FindGeometry(key) : nullptr;
+      const bool check = kept && CheckGeometry();
+      if (kept && !check) {
+        ib = kept->buffer;
+        oib = kept->offset;
+        vertex_count = kept->max_index + 1;
+        stats_.geometry_served += bytes;
       } else {
-        const uint32_t* src = reinterpret_cast<const uint32_t*>(d.index.data + first);
-        uint32_t* dst = reinterpret_cast<uint32_t*>(scratch_.data());
-        for (size_t k = 0; k < d.icount; k++) {
-          const uint32_t v = __builtin_bswap32(src[k]);
-          dst[k] = v;
-          max_index = std::max(max_index, v);
+        scratch_.resize(bytes);
+        uint32_t max_index = 0;
+        if (isize == 2) {
+          const uint16_t* src = reinterpret_cast<const uint16_t*>(d.index.data + first);
+          uint16_t* dst = reinterpret_cast<uint16_t*>(scratch_.data());
+          for (size_t k = 0; k < d.icount; k++) {
+            const uint16_t v = __builtin_bswap16(src[k]);
+            dst[k] = v;
+            max_index = std::max<uint32_t>(max_index, v);
+          }
+        } else {
+          const uint32_t* src = reinterpret_cast<const uint32_t*>(d.index.data + first);
+          uint32_t* dst = reinterpret_cast<uint32_t*>(scratch_.data());
+          for (size_t k = 0; k < d.icount; k++) {
+            const uint32_t v = __builtin_bswap32(src[k]);
+            dst[k] = v;
+            max_index = std::max(max_index, v);
+          }
         }
+        if (check) {
+          stats_.geometry_checked++;
+          if (kept->max_index != max_index || std::memcmp(kept->data, scratch_.data(), bytes) != 0)
+            stats_.geometry_differences++;
+          ib = kept->buffer;
+          oib = kept->offset;
+        } else if (uint8_t* place = d.index.version ? PushPersistent(key, bytes, max_index, ib, oib) : nullptr) {
+          std::memcpy(place, scratch_.data(), bytes);
+        } else if (!Push(scratch_.data(), bytes, 16, ib, oib)) {
+          return Skip("tampon d'envoi plein");
+        }
+        vertex_count = max_index + 1;
       }
-      if (!Push(scratch_.data(), bytes, 16, ib, oib)) return Skip("tampon d'envoi plein");
-      vertex_count = max_index + 1;
     }
 
     // Sommets : plage [vstart, vstart + vertex_count) de chaque tampon, convertie dans l'ordre des octets de
@@ -824,31 +879,56 @@ class RendererImpl final : public Renderer {
       if (!aligned) return Skip("sommet non aligné sur 4 octets");
       VkBuffer buffer;
       VkDeviceSize offset;
-      uint8_t* out = Push(nullptr, bytes, 16, buffer, offset);
-      if (!out) return Skip("tampon d'envoi plein");
-      const uint8_t* in = vb.data + first;
-      const size_t words = bytes / 4;
-      if (std::all_of(plan_.begin(), plan_.end(), [](uint8_t k) { return k == 1; })) {
-        for (size_t i = 0; i < words; i++) {
-          uint32_t w;
-          std::memcpy(&w, in + i * 4, 4);
-          w = __builtin_bswap32(w);
-          std::memcpy(out + i * 4, &w, 4);
-        }
+      // Forme de la conversion : pas et plan (une même géométrie peut être lue avec deux déclarations).
+      uint32_t form = 2166136261u ^ vb.stride;
+      for (uint8_t k : plan_) form = (form ^ k) * 16777619u;
+      const GeomKey key{vb.version, form, uint32_t(bytes)};
+      const GeomEntry* kept = vb.version ? FindGeometry(key) : nullptr;
+      const bool check = kept && CheckGeometry();
+      if (kept && !check) {
+        buffer = kept->buffer;
+        offset = kept->offset;
+        stats_.geometry_served += bytes;
       } else {
-        const size_t per_vertex = plan_.size();
-        const uint8_t* plan = plan_.data();
-        for (size_t v = 0; v < vertex_count; v++) {
-          for (size_t k = 0; k < per_vertex; k++) {
-            const size_t i = (v * per_vertex + k) * 4;
+        uint8_t* out = nullptr;
+        if (check) {
+          scratch_.resize(bytes);
+          out = scratch_.data();
+        } else if (vb.version) {
+          out = PushPersistent(key, bytes, 0, buffer, offset);
+        }
+        if (!out) out = Push(nullptr, bytes, 16, buffer, offset);
+        if (!out) return Skip("tampon d'envoi plein");
+        const uint8_t* in = vb.data + first;
+        const size_t words = bytes / 4;
+        if (std::all_of(plan_.begin(), plan_.end(), [](uint8_t k) { return k == 1; })) {
+          for (size_t i = 0; i < words; i++) {
             uint32_t w;
-            std::memcpy(&w, in + i, 4);
-            if (plan[k] == 1)
-              w = __builtin_bswap32(w);
-            else if (plan[k] == 2)
-              w = ((w & 0x00FF00FFu) << 8) | ((w >> 8) & 0x00FF00FFu);
-            std::memcpy(out + i, &w, 4);
+            std::memcpy(&w, in + i * 4, 4);
+            w = __builtin_bswap32(w);
+            std::memcpy(out + i * 4, &w, 4);
           }
+        } else {
+          const size_t per_vertex = plan_.size();
+          const uint8_t* plan = plan_.data();
+          for (size_t v = 0; v < vertex_count; v++) {
+            for (size_t k = 0; k < per_vertex; k++) {
+              const size_t i = (v * per_vertex + k) * 4;
+              uint32_t w;
+              std::memcpy(&w, in + i, 4);
+              if (plan[k] == 1)
+                w = __builtin_bswap32(w);
+              else if (plan[k] == 2)
+                w = ((w & 0x00FF00FFu) << 8) | ((w >> 8) & 0x00FF00FFu);
+              std::memcpy(out + i, &w, 4);
+            }
+          }
+        }
+        if (check) {
+          stats_.geometry_checked++;
+          if (std::memcmp(kept->data, scratch_.data(), bytes) != 0) stats_.geometry_differences++;
+          buffer = kept->buffer;
+          offset = kept->offset;
         }
       }
       const uint32_t binding = uint32_t(bindings_.size());
@@ -1126,6 +1206,7 @@ class RendererImpl final : public Renderer {
 
   const Stats& stats() const override { return stats_; }
   void ResetStats() override { stats_ = Stats(); }
+  void SetGeometryCheck(uint32_t every) override { geom_check_ = every; }
 
  private:
   void Log(const std::string& s) {
@@ -1173,6 +1254,60 @@ class RendererImpl final : public Renderer {
     if (b.buffer) vk_.vkDestroyBuffer(dev_, b.buffer, nullptr);
     if (b.memory) vk_.vkFreeMemory(dev_, b.memory, nullptr);
     b = Buffer();
+  }
+
+  // Géométrie persistante déjà convertie, ou nullptr.
+  const GeomEntry* FindGeometry(const GeomKey& key) {
+    const auto it = geom_.find(key);
+    return it == geom_.end() ? nullptr : &it->second;
+  }
+
+  bool CheckGeometry() { return geom_check_ && ++geom_seen_ % geom_check_ == 0; }
+
+  // Place en mémoire persistante pour une géométrie à écrire tout de suite, ou nullptr (tampon de l'image à la place) :
+  // trop grande, plus de mémoire, ou arène en cours de reprise. Une arène reprise sort d'abord ses plages de la table,
+  // même si elles servent encore (elles reviendront dans l'arène en cours), puis attend la fin des images en vol.
+  uint8_t* PushPersistent(const GeomKey& key, size_t size, uint32_t max_index, VkBuffer& buffer, VkDeviceSize& offset) {
+    if (size > kGeomArena / 4) return nullptr;
+    const auto nouvelle = [this] {
+      GeomArena a;
+      a.buffer = CreateBuffer(kGeomArena, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+      if (!a.buffer.buffer) return false;
+      arenas_.push_back(a);
+      arena_ = arenas_.size() - 1;
+      return true;
+    };
+    if (arenas_.empty() && !nouvelle()) return nullptr;
+    VkDeviceSize off = (arenas_[arena_].buffer.used + 15) / 16 * 16;
+    if (off + size > arenas_[arena_].buffer.size) {
+      if (arenas_.size() < kGeomArenas) {
+        if (!nouvelle()) return nullptr;
+      } else {
+        const size_t suivante = (arena_ + 1) % kGeomArenas;
+        GeomArena& s = arenas_[suivante];
+        if (s.free_at == 0) {
+          for (auto it = geom_.begin(); it != geom_.end();)
+            it = it->second.arena == suivante ? geom_.erase(it) : std::next(it);
+          s.free_at = frame_ + kSlots + 1;  // l'image en cours a pu s'en servir
+          stats_.geometry_recycled++;
+          return nullptr;
+        }
+        if (frame_ < s.free_at) return nullptr;
+        s.free_at = 0;
+        s.buffer.used = 0;
+        arena_ = suivante;
+      }
+      off = 0;
+    }
+    GeomArena& a = arenas_[arena_];
+    a.buffer.used = off + size;
+    buffer = a.buffer.buffer;
+    offset = off;
+    uint8_t* place = a.buffer.mapped + off;
+    geom_[key] = GeomEntry{buffer, offset, place, max_index, uint32_t(arena_)};
+    stats_.upload_bytes += size;
+    stats_.geometry_written += size;
+    return place;
   }
 
   // Sous-allocation linéaire dans les tampons d'envoi de l'image en cours. Renvoie l'adresse écrite.
@@ -1766,7 +1901,7 @@ class RendererImpl final : public Renderer {
   uint32_t shader_generation_seen_ = 0;
   std::unordered_map<uint64_t, VkPipeline> pipelines_;
   std::unordered_map<uint32_t, VkSampler> samplers_;
-  uint32_t pipelines_since_save_ = 0;
+  std::atomic<uint32_t> pipelines_since_save_{0};  // thread de rendu ; remis à zéro par le thread qui enregistre
   std::unordered_map<uint64_t, TextureEntry> textures_;
   std::map<std::string, Target> targets_;
   Target* current_ = nullptr;
@@ -1795,6 +1930,11 @@ class RendererImpl final : public Renderer {
   std::vector<uint8_t> globals_[2];
   std::vector<uint8_t> texture_data_;
   std::vector<uint8_t> scratch_;
+  std::unordered_map<GeomKey, GeomEntry, GeomKeyHash> geom_;
+  std::vector<GeomArena> arenas_;
+  size_t arena_ = 0;
+  uint32_t geom_check_ = 0;
+  uint64_t geom_seen_ = 0;
   std::vector<uint8_t> plan_;
 
   Stats stats_;

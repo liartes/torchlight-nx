@@ -6,7 +6,49 @@ Torchlight = Ogre3D (D3D9RenderSystem porté Xbox), RTTI MSVC présents dans l'e
 l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
 
 ## État et reprise
-- REPRENDRE ICI (2026-11-01, nuit). **1.0.4 publiée** : main (commit « 1.0.4 »), torchlight-nx poussé sur GitHub
+- **REPRENDRE ICI (état du 2026-11-05 au soir). 1.0.5 préparée, pas publiée : commit « 1.0.5 » sur main, torchlight-nx synchronisé en local et pas poussé. Session finale (étape 6) pas jouée.** Dernière version publiée : 1.0.4.
+  Code : 15b0d05, plus l'ordre des fonctions (édition des liens) et, après la build, les crédits et les notes : le code compilé ne change pas. Ne plus toucher au code avant la publication, sinon refaire le profil.
+  Console XJE1 : dist/torchlight-joueurs-1.0.5-20261105-1902.nro (MD5 d8867f5f), sans torchlight.toml, relevé des piles coupé, pgo/ de la console supprimé. À vérifier en reprenant : `console.sh etat`. Build instrumentée gardée localement : dist/torchlight-pgo-1.0.5-20261104-2256.nro (MD5 8bde8799, chemins locaux, **jamais la distribuer**).
+  Étapes :
+  1. Fait : session PGO du 2026-11-05, 13:12-13:46 (34 min, sans plantage, sortie par le menu du jeu), 10 vidages ; le dernier finit ~30 s avant la sortie, seules ces ~30 s manquent au profil.
+  2. Fait : pgo/ = cette session (245 .gcda, identique à la console ; seul torchlight_init.cpp, tables de données sans fonction, n'en a pas) ; profil précédent dans pgo-natives-seules/ ; journaux dans switch-logs-archive/20261105-session-pgo/.
+  3. Fait : ordre des fonctions refait (2962 fonctions, d'après pilas-archive/rex_pilas-20261104-2003.txt et l'ELF joueurs 20261104-1927), puis ordre_natives.py (19 natives ajoutées).
+  4. Fait (`JOBS=8 switch/build_joueurs.sh`, 13 min) : dist/torchlight-joueurs-1.0.5-20261105-1902.nro (MD5 d8867f5f), ELF switch/elf/torchlight-joueurs-1.0.5-20261105-1902.elf, zip de la build gardé en dist/torchlight-nx-1.0.5-build.zip (MD5 2731c412, crédits d'avant). Vérifié : audit_profil.py (218 fichiers, 0 fonction sans profil, 0 échec), objets et noms de pgo/ (seul torchlight_init.cpp sans .gcda : tables de données), aucun nom d'utilisateur. Pour une autre build : « 0 coverage mismatch » ne prouve rien pour le code généré ; -Wno-missing-profile masque un .gcda absent ; « source locations » garde le profil, seul « number of counters » le perd.
+  5. Fait (dist/torchlight-essai-reference.toml, retiré depuis ; switch-logs-archive/20261105-mesure-finale/ ; détail à la fin du journal) : ville image 12,78 ms, mine 9,74 ms à 176-186 dessins, combat 150-250 dessins écart 19,02 ms, 250-320 22,07. Aucun gain visible contre les sessions du 2026-11-04, ville +4 % contre 12,28 ms à GPU 307,2 MHz, cause non établie ; environ un quart de moins que le recompilé du profil 1.0.4. Essai GPU / interface par .toml proposé, écarté par l'utilisateur : le gain contre la 1.0.4 lui suffit. Reste possible après la 1.0.5 : torchlight_gpu_mhz = 0, torchlight_interface = 0, puis ancien ordre des fonctions.
+  6. Pas jouée, à proposer avant la publication : session finale ~30 min sans torchlight.toml : combats, zones, sauvegarde, sortie par le menu du jeu, veille. À vérifier aussi : passage en dock (non testé avec la règle de l'interface), séries d'images lentes toutes les ~5 s à 510 dessins menu ouvert (avertissement de Mesa limité : disparition pas confirmée), batterie et chauffe (coût du GPU à 460,8 MHz, jamais chiffré), blocs du noyau (ligne « nucleo: » : 2821 au plus dans la session PGO du 2026-11-05, contre 2350 dans celle du 2026-11-04, de même durée et aussi instrumentée ; aucune erreur, cause non cherchée).
+  7. Fait, sauf la publication : dist/torchlight-nx-1.0.5.zip (MD5 3aac0e63, refait à la main avec le .nro testé, crédits à jour : zlib, poses de torchlight-rekindled) et sa copie protégée dist/torchlight-nx-1.0.5-publie.zip, texte dist/RELEASE-1.0.5.md (sans chiffres de performance), commit sur main, commit local dans torchlight-nx. Reste, seulement à la demande de l'utilisateur : `git push` dans torchlight-nx, release v1.0.5 créée par lui sur GitHub, puis compléter la ligne « Objectif » en tête de ce fichier. Protéger aussi le zip publié avant tout nouveau build_joueurs.sh, et changer TORCHLIGHT_VERSION avant.
+  Décisions de l'utilisateur (2026-11-04) : GPU à 460,8 MHz en portable, par défaut ; idée d'un boost limité à 10 s abandonnée ; pas de boost en jeu ; pics des archers laissés tels quels ; pas de nouveau chantier avant la 1.0.5. Gardés pour plus tard, non commencés : rejouer les quadrilatères des fenêtres de l'interface inchangées (estimé 2-3 % en combat, davantage au menu), laisser le thread principal continuer pendant les aides (état partagé), étaler les créations d'unités (logique du jeu).
+  Limite qui reste : en combat lourd, ~24-29 ms entre images (relevé actif), attente du GPU quasi nulle : le thread principal limite, profil plat.
+- **Acquis du 2026-11-04, tous sur main.** Bilan transmissible : switch/DECOUVERTES_2026-11-04.md (aussi en page privée https://claude.ai/artifact/6EeZLZfPzMs63p4JZ3iznv, à republier si le fichier change, script dans switch-logs-archive/outils-session-20261104/). Détail, essai par essai : fin de switch/RENDU_NATIF.md.
+  Mémoire : fenêtre du jeu alignée sur 2 Mo (bug du SDK, virtmemFindAslr : combat -15 à -17 %), code du .nro reprojeté (src/torchlight_code_blocs.cpp, -2 à -4 %), vue 0xE0000000 (0 à -2 %). Rendu : géométrie persistante (src/natif/rendu.cpp, ville -7,4 %, mine -7,0 %, combat écart -4,7 à -6,3 %), pause dans l'attente du GPU (sub_82774170), avertissement de Mesa écrit une fois sur 1000. Chargement : inflate et lectures du zip (src/torchlight_inflate.cpp), primitives natives (src/torchlight_donnees_natif.cpp), atomiques sans verrou global (switch/tools/atomiques_sans_verrou.py), seuil du boost à 400 ms. GPU : torchlight_gpu_mhz (src/torchlight_boost.cpp). Interface : torchlight_interface, mode 3 par défaut (reconstruction seulement si une fenêtre dessinée a changé ; console, vrai combat : 14 400 images, 0 différence ; peu de gain en combat, barres et chiffres de dégâts changent vraiment). 13 natives de plus et verrous à courte attente des aides, validés sur PC ; gain seulement avec le nouveau profil. ZCULL essayé : aucun gain, gardé coupé.
+  Sans mesure de gain à ce jour : interface, aides, ces 13 natives.
+  Essais sur ce PC, sans le Ryzen (injoignable le 2026-11-04) : fenêtre sur le bureau de l'utilisateur, à prévenir ; pas de Weston ici. switch-logs-archive/outils-session-20261104/ : essai.sh <nom> <s> [options] (session scriptée, ville et menus, données switch/out-pc/donnees-console-20261103), lance_sans_gdb.py (autorise l'attachement de gdb : ptrace_scope = 1) et gdb_redessin.py (point d'observation), tranches.py et episodes.py (piles par scène, rex_longues.txt), asm.py (asm d'une fonction). La manette du Ryzen ne convient pas ici : le menu est prêt plus tôt, les appuis se décalent ; gdb dès le démarrage les décale aussi.
+- Natives (demande de l'utilisateur : top 50 même pour un gain minime, puis les 50 suivantes) : fin de src/torchlight_ogre_natif.cpp, 109 fonctions : 49 du top 50 (sub_821D5410 exceptée), 37 des 50
+  suivantes, le reste de rang inférieur ou auxiliaires. Option -DTORCHLIGHT_NATIVES_FIXES (Switch, ON par défaut) : sans alternance, validation ni repli ; OFF pour un A/B, qui demande alors le profil de
+  l'alternance. Validées sur le Ryzen (mode 2 : 122 M appels en 240 s, 0 différence, dont 1,32 M de free du tas ; 15 sessions de 260 s en donjon sans plantage ; capture vérifiée). Couverture PC :
+  lignes « [couverture] » du journal ; 6 natives jamais atteintes, leur seul appelant étant devenu natif. Aucun défaut vu par l'utilisateur dans les menus et les dialogues.
+  Mesures sur la console (fin du journal) : sans profil pour elles, **aucun gain** (switch-logs-archive/20261103-essai-natives/) ; avec le profil de l'alternance (dist/torchlight-essai-natives-pgo.nro,
+  80008c80), dans la session ville -6,2 ± 1,4 %, mine -4,5 ± 0,7 %, combat -7,3 ± 3,5 %, **mais écart surestimé : ce profil ralentit le recompilé de ~3 % à l'arrêt** ; de session à session contre le
+  recompilé d'avant : ville -3,7 %, mine -1,5 %, combat non comparable (switch-logs-archive/20261103-essai-natives-pgo/). Poses du rendu (torchlight_poses_rendu) : pas de gain et p99 du combat pire
+  dans les deux sessions (+21 ± 19 %, +16 ± 15 %) : coupées. Laissées de côté : sub_821D5410 (événements froids, que les essais ne couvrent pas), bibliothèque C du jeu (sub_82883C50
+  attente, sub_8287F408, sub_8287F090, sub_82867A10, sub_821BC898 printf), inflate (sub_823E1590, sub_823E31D8), sub_8247F888 (chargement d'un maillage), sub_821F3F28 et sub_821A6D90 (anneau et
+  registres du GPU émulé), sub_821BA040 (Direct3D du jeu), sub_821DA090 (billboards, déjà en parallèle). Après une régénération du code : switch/tools/appels_figes.py ; après une nouvelle
+  native ou un nouvel ordre : switch/tools/ordre_natives.py. Méthode et pièges : fin du journal.
+  Essais sur le Ryzen : `ssh ryzen`, mêmes chemins, jeu sans écran par Weston ; `rsync -a --exclude-from=<exclusions> ./ ryzen:workspace/torchlight/`, `cmake --build switch/out-pc -j 12`, binaire copié dans
+  ~/essais/bin2 ; `BINAIRE=$HOME/essais/bin2/torchlight MANETTE=$HOME/essais/manette-donjon.txt ~/essais/veille.sh <nom> <s> [options]` (le jeu démarre ~1 min après : compter large),
+  ~/essais/serie.sh 3 260 5. Copies des scripts du bloc-notes et du Ryzen (non versionnées, elles citent des chemins locaux) : switch-logs-archive/outils-session-20261103/ (show.sh : asm d'une
+  fonction depuis le code généré ; suivants.py : classement du profil hors crochets ; rsync-exclusions.txt).
+- Historique (2026-11-03, commité depuis). Trois essais, sur la console dans dist/torchlight-essai-coeur-bb-recyclage.nro
+  + .toml (torchlight_alterner). Mesuré (fin du journal) : ville -3,95 %, mine -4,17 % tout activé : cœur -2,1 à -2,4 %,
+  recyclage -1,5 %, billboards -0,2 à -0,35 % (peu de particules). Combat non concluant (± 7 %) : à refaire avec des
+  fenêtres courtes. Analyse : switch-logs-archive/20261103-essai-coeur-bb/analyse_ab.py. La console a torchlight.toml.
+  Étude des poses faite sur PC, rien de codé. switch/out-joueurs contient cette build, plus la 1.0.4.
+  Poses : prototype src/torchlight_poses.cpp (--torchlight_poses, --torchlight_poses_double, défauts coupés), validé sur PC
+  et mesuré sur la console (fin du journal) : combat -4,1 à -4,6 %, ville ~-1 %, mine -0,3 % ; billboards et seconde instance
+  plus petits. Analyse : switch/tools/ab_regression.py. Validation à l'octet en vrai combat faite (103 923 poses, 1 différente, aucun défaut vu ; décalage d'une image accepté par l'utilisateur, souvenir
+  rendu-intact). Reste : valeurs par défaut pour une version. Appels figés
+  remis en sub_X dans le code généré (non versionné) : sub_821BB578, sub_821B9478, sub_8219D288, sub_821E2D90.
+- (2026-11-01, nuit). **1.0.4 publiée** : main (commit « 1.0.4 »), torchlight-nx poussé sur GitHub
   le 2026-11-01 ; release v1.0.4 à créer par l'utilisateur avec dist/torchlight-nx-1.0.4.zip (MD5 52a8bab9, refait
   à la main avec le .nro testé dist/torchlight-joueurs-1.0.4-20261101-2145.nro, MD5 6e78a8dd, et le README aux
   crédits de renut-nx ; zip de build_joueurs.sh gardé en dist/torchlight-nx-1.0.4-build.zip) et
@@ -28,7 +70,7 @@ l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
     principal, hors code généré), mode 4 cœurs (renut-nx docs/four-core-mode.md), changements de mode des denormals
     (24 661 sites, à compter d'abord), écritures de registres mortes (dead_ctx_defs, risqué). La doc de renut-nx :
     https://github.com/ChanseyIsTheBest/renut-nx (docs/codegen-enhancements.md surtout).
-- REPRENDRE ICI (2026-10-28, soir). **1.0.3 publiée** : main 25ccc79 (+ commit des notes), torchlight-nx 6624ad2
+- Historique (2026-10-28, soir). **1.0.3 publiée** : main 25ccc79 (+ commit des notes), torchlight-nx 6624ad2
   poussé sur GitHub le 2026-10-28 ; release v1.0.3 à créer par l'utilisateur (texte fourni) avec
   dist/torchlight-nx-1.0.3.zip (MD5
   259af13c ; .nro 3e94a750 = dist/torchlight-joueurs-1.0.3-20261028-2037.nro ; ELF
@@ -153,7 +195,7 @@ l'exécution par le RT Shader System d'Ogre (assets/rtshaderlib).
   description ») : copier sous le nom final, sans .tmp + rename (console.sh le fait déjà).
 - Limite : le thread principal (Ogre ~74 %, logique ~25 %). Profil plat ; voir « Performances » pour la suite.
 - Consignes de l'utilisateur : optimiser aux fréquences de base (CPU 1020 MHz, RAM et GPU d'origine ; le surcadençage
-  reste au choix du joueur) et sans rien changer au rendu (pas d'ombres une image sur deux, pas de mise à jour
+  reste au choix du joueur ; exception voulue par l'utilisateur le 2026-11-04 : GPU au profil officiel de 460,8 MHz en portable) et sans rien changer au rendu (pas d'ombres une image sur deux, pas de mise à jour
   sautée : risque de clignotement). Répondre en français. Tests n°1 à 21 faits avec RAM et GPU surcadencés ;
   à partir du n°22, fréquences de base (ligne « relojes » de rex_perfil.log).
 - Pour reprendre : lire la fin du journal switch/RENDU_NATIF.md (chaque essai, mesures, pièges). Restent les tests
@@ -284,7 +326,7 @@ D3D9RenderSystem d'Ogre reçoit ; l'émulation reste mais ne dessine plus rien.
 - switch/build_joueurs.sh : build LTO + PGO sans outils de développement (-DTORCHLIGHT_OUTILS=OFF : manette de script
   et capture d'écran ; TORCHLIGHT_NATIF reste) dans switch/out-joueurs, puis dist/torchlight-nx-<version>.zip
   (switch/torchlight/ : .nro, README.md, LICENSE, THIRD_PARTY_NOTICES.md). Version : TORCHLIGHT_VERSION dans
-  switch/CMakeLists.txt (1.0.4).
+  switch/CMakeLists.txt (1.0.5).
 - Lancement en mode applet (album) : message bloquant à l'écran (appletGetAppletType != Application) au lieu du
   simple avertissement du SDK.
 - Le .nro contient le code de default.xex recompilé (comme les .nro de nfsmw-nx) : zone grise assumée dans le README ;
@@ -315,6 +357,7 @@ matrices, bindGpuProgramParameters court, KeTlsGetValue (SDK), sommets des billb
 (nœuds, applyToNode, images clés, matrices des os), concatenateAffineMatrices, _updateAutoParams (10 types) ;
 relevé allégé (tables plates, pages vérifiées) ; lectures de pak.zip par cache de blocs de 64 Ko (64 Mo).
 Écarté : skip_lr / non_argument_as_local (section critique jamais relâchée), sauter des mises à jour d'images.
+Options d'essai du 2026-11-04 : --torchlight_interface (2 : validation à l'octet), --torchlight_journal_stats (bilans au journal, noms des fenêtres de l'interface), --torchlight_images_longues et --torchlight_images_longues_ms (chien de garde, rex_longues.txt), --torchlight_gpu_mhz.
 Fait aussi (2026-10-14) : appels indirects promus (-13/-15 %). Fait le 2026-10-27/28 : boucle des contrôleurs en
 liste plate, particules de ParticleUniverse sur plusieurs cœurs (src/torchlight_particules.cpp ; état partagé
 analysé avec switch/tools/suivi_memoire/), natives de la logique et du rendu, mode boost des chargements (voir

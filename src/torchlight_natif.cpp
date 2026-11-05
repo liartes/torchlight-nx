@@ -8,6 +8,7 @@
 
 #include "torchlight_natif.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -45,6 +46,7 @@
 #include "natif/rendu.h"
 #include "torchlight_boost.h"
 #include "torchlight_capture.h"
+#include "torchlight_coeurs.h"
 #include "torchlight_invite.h"
 
 REXCVAR_DEFINE_BOOL(torchlight_natif, false, "Torchlight",
@@ -75,6 +77,12 @@ REXCVAR_DEFINE_STRING(torchlight_natif_ecrans, "", "Torchlight",
 REXCVAR_DEFINE_STRING(torchlight_natif_shaders, "", "Torchlight",
                       "Bibliothèque de shaders du rendu natif (vide = cache construit sur cette machine, "
                       "<données utilisateur>/cache/natif)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(torchlight_geometrie, true, "Torchlight",
+                    "Géométrie inchangée gardée convertie en mémoire du GPU au lieu d'être renvoyée à chaque image")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(torchlight_geometrie_verif, 0, "Torchlight",
+                     "Essai : une géométrie gardée sur N est reconvertie et comparée (0 = jamais)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace torchlight::natif {
@@ -228,6 +236,7 @@ void FreeRetiredGeometry();
 // Octets de géométrie copiés et repris (relevé), pour le bilan : comptés dans l'image (thread du jeu, sans atomique),
 // cumulés par le thread de rendu.
 uint64_t g_geometry_reused = 0, g_geometry_copied = 0;
+uint64_t g_geometry_recycled = 0, g_geometry_allocated = 0;
 
 Clock::time_point g_last_report;
 uint32_t g_frames_since_report = 0;
@@ -291,6 +300,7 @@ struct Frame {
   uint32_t width = 1280, height = 720;
   double game_ms = 0, read_ms = 0, tex_ms = 0, wait_ms = 0;  // thread du jeu
   uint64_t geometry_reused = 0, geometry_copied = 0;          // octets (relevé)
+  uint32_t geometry_recycled = 0, geometry_allocated = 0;     // copies faites dans un tampon du réservoir, ou neuf
   void Clear() {
     commands.clear();
     draws_used = 0;
@@ -298,6 +308,7 @@ struct Frame {
     arena.Reset();
     game_ms = read_ms = tex_ms = wait_ms = 0;
     geometry_reused = geometry_copied = 0;
+    geometry_recycled = geometry_allocated = 0;
   }
 };
 constexpr int kFrames = 3;
@@ -309,6 +320,7 @@ Frame* g_cur = nullptr;
 bool g_render_thread = false;
 void* RenderThreadMain(void*);
 void ProcessFrame(Frame& f);
+std::atomic<bool> g_vulkan_actif{true};  // essai : voir VulkanActif
 
 // Captures d'écran programmées (torchlight_natif_ecrans).
 std::vector<double> g_shots;
@@ -368,6 +380,7 @@ bool Init() {
     Log("[natif] échec de l'initialisation du rendu natif");
     return false;
   }
+  g_renderer->SetGeometryCheck(uint32_t(std::max(0, int(REXCVAR_GET(torchlight_geometrie_verif)))));
   presenter->SetGuestOutputFromApp(true);
   g_last_report = g_start = Clock::now();
   const std::string shots = REXCVAR_GET(torchlight_natif_ecrans);
@@ -409,7 +422,19 @@ void Report() {
     const uint64_t copied = g_geometry_copied, reused = g_geometry_reused;
     g_geometry_copied = g_geometry_reused = 0;
     text += "\n  relevé de la géométrie, Ko par image : " + std::to_string(copied / g_frames_since_report / 1024) +
-            " copiés, " + std::to_string(reused / g_frames_since_report / 1024) + " repris (tampons inchangés)";
+            " copiés, " + std::to_string(reused / g_frames_since_report / 1024) + " repris (tampons inchangés) ; copies "
+            "par image : " + std::to_string(g_geometry_recycled / g_frames_since_report) + " dans un tampon recyclé, " +
+            std::to_string(g_geometry_allocated / g_frames_since_report) + " dans un neuf";
+    g_geometry_recycled = g_geometry_allocated = 0;
+  }
+  if (g_frames_since_report && (st.geometry_served || st.geometry_written)) {
+    text += "\n  géométrie persistante, Ko par image : " + std::to_string(st.geometry_served / g_frames_since_report / 1024) +
+            " servis, " + std::to_string(st.geometry_written / g_frames_since_report / 1024) + " écrits ; " +
+            std::to_string(st.geometry_entries) + " plages, " + std::to_string(st.geometry_arenas) + " arènes, " +
+            std::to_string(st.geometry_recycled) + " reprises";
+    if (st.geometry_checked)
+      text += " ; vérifiées " + std::to_string(st.geometry_checked) + ", différentes " +
+              std::to_string(st.geometry_differences);
   }
   text += "\n  dans Vulkan, ms par image : sommets " + Ms(st.ms_vertices) + ", pipeline et constantes " +
           Ms(st.ms_constants) + ", textures " + Ms(st.ms_textures) + ", descripteurs " + Ms(st.ms_descriptors);
@@ -420,11 +445,16 @@ void Report() {
   int shown = 0;
   for (const auto& [name, n] : st.missing_shaders)
     if (shown++ < 8) text += "\n  shader absent : " + name;
-  REXLOG_INFO("{}", text);
+  if (torchlight::coeurs::JournalStats()) REXLOG_INFO("{}", text);
   // Cache de pipelines réécrit une fois la scène stable (aucun pipeline créé pendant ces 10 s) : pas d'écriture
   // sur la carte SD en plein chargement.
-  if (st.pipelines_created == 0 && g_renderer->SavePipelineCache())
-    REXLOG_INFO("[natif] cache de pipelines enregistré");
+  // Sur le thread de compilation : écrire sur la carte depuis le thread de rendu lui prenait 130 à 170 ms, et le thread du
+  // jeu l'attendait (saccades en plein combat, 2026-11-04).
+  if (st.pipelines_created == 0) {
+    RunInBackground([] {
+      if (g_renderer && g_renderer->SavePipelineCache()) REXLOG_INFO("[natif] cache de pipelines enregistré");
+    });
+  }
   g_renderer->ResetStats();
   g_frames_since_report = 0;
   g_cpu_ms = g_draw_ms = g_frame_ms = g_record_ms = g_tex_ms = g_wait_ms = 0.0;
@@ -750,7 +780,7 @@ void* RenderThreadMain(void*) {
 
 // Rejoue une image relevée : Renderer, présentation, bilan.
 void ProcessFrame(Frame& f) {
-  if (!g_renderer) return;
+  if (!g_renderer || !g_vulkan_actif.load(std::memory_order_relaxed)) return;
   const auto t0 = Clock::now();
   g_render_frame++;
   for (size_t i = 0; i < f.consts_used; i++) ConvertConstants(f.consts[i]);
@@ -786,6 +816,8 @@ void ProcessFrame(Frame& f) {
   g_draw_ms += f.read_ms;
   g_geometry_copied += f.geometry_copied;
   g_geometry_reused += f.geometry_reused;
+  g_geometry_recycled += f.geometry_recycled;
+  g_geometry_allocated += f.geometry_allocated;
   g_tex_ms += f.tex_ms;
   g_wait_ms += f.wait_ms;
   g_frames_since_report++;
@@ -854,11 +886,12 @@ void BeginGameFrame() {
   if (!OwnThread()) return;
   g_frame_start = Clock::now();
   g_frame++;
+  // Avant toute retraite de cette image : la tranche qu'elle remplira est vidée ici.
+  FreeRetiredGeometry();
   if ((g_frame & 63) == 0) {
     torchlight::invite::ForgetVerifiedPages();
     ForgetOldGeometry();
   }
-  FreeRetiredGeometry();
   // Image libre : le thread de rendu en rend une quand il a fini de la rejouer (au plus une d'avance).
   {
     std::unique_lock<std::mutex> lock(g_frames_mutex);
@@ -877,6 +910,7 @@ void EndGameFrame() {
   Frame* f = g_cur;
   g_cur = nullptr;
   f->game_ms = std::chrono::duration<double, std::milli>(Clock::now() - g_frame_start).count();
+  torchlight::coeurs::Image(f->draws_used, f->game_ms, f->wait_ms, f->read_ms, f->tex_ms);  // essai (src/torchlight_coeurs.cpp)
   if (!g_render_thread) {
     ProcessFrame(*f);  // pas de thread de rendu : tout de suite, sur le thread du jeu
     f->Clear();
@@ -1099,8 +1133,13 @@ struct GeometryCopy {
   uint32_t locks = 0;      // BufferLocks au moment de la copie
   uint64_t last_used = 0;  // image
   uint32_t max_index = 0;  // tampon d'indices : plus grand indice de la plage
+  uint64_t version = 0;    // numéro unique de ce contenu (géométrie persistante, src/natif/rendu.cpp)
+  bool reprise = false;    // déjà servie depuis la copie : le contenu n'est pas réécrit à chaque image
   std::vector<uint8_t> bytes;  // adresse stable tant que la copie n'est pas remplacée (nœud de la map)
 };
+uint64_t g_geometry_version = 0;
+bool g_geometrie = true;  // géométrie persistante, thread du jeu : --torchlight_geometrie, ou alternance (GeometrieActive)
+bool g_geometrie_lue = false;
 // Table plate (adressage ouvert, sondage linéaire, valeurs en place) : une recherche lit en général une seule ligne
 // de cache, contre 2 ou 3 nœuds dispersés pour une unordered_map (~700 recherches par image en ville : 0,46 ms sur la
 // console avec la RAM d'origine). Une référence rendue vaut jusqu'à l'insertion suivante ; bytes.data() reste
@@ -1161,18 +1200,64 @@ class GeometryMap {
   int bits_ = 0;
 };
 GeometryMap g_geometry;
-// Copies remplacées ou oubliées : libérées seulement 8 images plus tard, quand plus aucune image en circulation
-// (au plus 3) ne peut les lire. Évite un shared_ptr par plage et par dessin (incréments atomiques, coûteux sur le
-// Cortex-A57 sans instructions LSE).
+// Copies remplacées ou oubliées : réutilisables seulement kRetireFrames images plus tard, quand plus aucune image en
+// circulation (au plus 3) ne peut les lire. Évite un shared_ptr par plage et par dessin (incréments atomiques, coûteux
+// sur le Cortex-A57 sans instructions LSE). Une tranche par image, vidée kRetiredSlots images plus tard.
 constexpr uint64_t kRetireFrames = 8;
-std::deque<std::pair<uint64_t, std::vector<uint8_t>>> g_retired;
+constexpr size_t kRetiredSlots = kRetireFrames + 2;
+std::vector<std::vector<uint8_t>> g_retired[kRetiredSlots];
+
+// Réservoir de tampons : les plages réécrites à chaque image (particules, interface) allouaient un tampon par copie et
+// libéraient en rafale au début de l'image ; malloc et free faisaient 1,6 % du thread principal en combat sur la
+// console, dont 0,44 % d'attente du verrou de malloc (profil du 2026-10-28). Classés par puissance de 2 de leur
+// capacité. Les premières copies gardent une allocation exacte (tampons statiques : pas de place perdue).
+constexpr int kReservoirClasseMin = 6, kReservoirClasseMax = 20;  // 64 octets à 2 Mo (capacité)
+constexpr size_t kReservoirOctetsMax = 16 * 1024 * 1024;
+std::vector<std::vector<uint8_t>> g_reservoir[kReservoirClasseMax + 1];
+size_t g_reservoir_octets = 0;
+bool g_recyclage = true;  // essai : faux, tampons alloués à chaque copie et libérés comme avant le réservoir
+
+int ClasseDeCapacite(size_t octets) { return 63 - __builtin_clzll(octets); }
 
 void Retire(std::vector<uint8_t>&& bytes) {
-  if (!bytes.empty()) g_retired.emplace_back(g_frame, std::move(bytes));
+  if (bytes.capacity()) g_retired[g_frame % kRetiredSlots].push_back(std::move(bytes));
+}
+
+// Tampon vide de capacité >= octets, s'il y en a un au réservoir ; sinon vide (le premier assign allouera).
+std::vector<uint8_t> TamponDuReservoir(size_t octets) {
+  std::vector<uint8_t> tampon;
+  if (!octets || !g_recyclage) return tampon;
+  const int classe = std::max(ClasseDeCapacite(octets), kReservoirClasseMin);
+  for (int c = classe; c <= std::min(classe + 2, kReservoirClasseMax); c++) {
+    auto& liste = g_reservoir[c];
+    // Classe d'origine : capacité entre 2^c et 2^(c+1), à vérifier sur les derniers rendus. Au-dessus : tous assez
+    // grands.
+    const size_t essais = std::min<size_t>(liste.size(), c == classe ? 8 : 1);
+    for (size_t i = 0; i < essais; i++) {
+      auto& candidat = liste[liste.size() - 1 - i];
+      if (candidat.capacity() < octets) continue;
+      tampon.swap(candidat);
+      candidat.swap(liste.back());
+      liste.pop_back();
+      g_reservoir_octets -= tampon.capacity();
+      return tampon;
+    }
+  }
+  return tampon;
 }
 
 void FreeRetiredGeometry() {
-  while (!g_retired.empty() && g_frame - g_retired.front().first > kRetireFrames) g_retired.pop_front();
+  auto& tranche = g_retired[g_frame % kRetiredSlots];
+  for (auto& tampon : tranche) {
+    const size_t capacite = tampon.capacity();
+    if (!g_recyclage || capacite < (size_t(1) << kReservoirClasseMin) ||
+        capacite >= (size_t(2) << kReservoirClasseMax) || g_reservoir_octets + capacite > kReservoirOctetsMax)
+      continue;  // libéré avec la tranche
+    tampon.clear();
+    g_reservoir[ClasseDeCapacite(capacite)].push_back(std::move(tampon));
+    g_reservoir_octets += capacite;
+  }
+  tranche.clear();
   while (!g_retired_names.empty() && g_frame - g_retired_names.front().first > kRetireFrames)
     g_retired_names.pop_front();
 }
@@ -1186,8 +1271,17 @@ const GeometryCopy& CopyRange(uint64_t id, const uint8_t* src, size_t first, siz
   c.last_used = g_frame;
   if (!c.bytes.empty() && c.locks == locks) {
     g_cur->geometry_reused += bytes;
+    c.reprise = true;
   } else {
+    c.version = ++g_geometry_version;
+    c.reprise = false;
     Retire(std::move(c.bytes));
+    c.bytes = TamponDuReservoir(bytes);
+    if (c.bytes.capacity()) {
+      g_cur->geometry_recycled++;
+    } else {
+      g_cur->geometry_allocated++;
+    }
     c.bytes.assign(src + first, src + first + bytes);
     const uint8_t* copy = c.bytes.data();
     uint32_t max_index = 0;
@@ -1225,6 +1319,10 @@ void ForgetOldGeometry() {
 // ramenées à 0 (vstart, istart). Faux pour un dessin vide.
 bool CopyGeometry(DrawDesc& d) {
   if (d.indexed ? !d.icount : !d.vcount) return false;
+  if (!g_geometrie_lue) {
+    g_geometrie_lue = true;
+    g_geometrie = REXCVAR_GET(torchlight_geometrie);
+  }
   uint32_t vertex_count = d.vcount;
   if (d.indexed) {
     const size_t isize = d.index.index_size == 2 ? 2 : 4;
@@ -1236,6 +1334,7 @@ bool CopyGeometry(DrawDesc& d) {
     const GeometryCopy& c = CopyRange(d.index.id, d.index.data, first, bytes, isize == 2, isize == 4);
     d.index.data = c.bytes.data();
     d.index.size = bytes;
+    d.index.version = g_geometrie && c.reprise ? c.version : 0;
     d.istart = 0;
     vertex_count = c.max_index + 1;
   }
@@ -1245,8 +1344,10 @@ bool CopyGeometry(DrawDesc& d) {
       vb.data = nullptr;
       continue;
     }
-    vb.data = CopyRange(vb.id, vb.data, first, bytes, false, false).bytes.data();
+    const GeometryCopy& c = CopyRange(vb.id, vb.data, first, bytes, false, false);
+    vb.data = c.bytes.data();
     vb.size = bytes;
+    vb.version = g_geometrie && c.reprise ? c.version : 0;
   }
   d.vstart = 0;
   return true;
@@ -1270,6 +1371,13 @@ static void PrefetchNextDraw(const Frame& f) {
 
 static void PrefetchBuffer(uint32_t addr) {
   __builtin_prefetch(&g_buffer_locks[BufferLockSlot(torchlight::invite::ToPhysical(addr & ~3u))]);
+}
+
+void RecyclageActif(bool actif) { g_recyclage = actif; }
+void VulkanActif(bool actif) { g_vulkan_actif.store(actif, std::memory_order_relaxed); }
+void GeometrieActive(bool active) {
+  g_geometrie_lue = true;
+  g_geometrie = active;
 }
 
 void Render(uint32_t op, const uint8_t* base) {

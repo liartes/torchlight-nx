@@ -12,7 +12,7 @@ torchlight_natif_seul = true
 
 # Variables du pilote Mesa/NVK (NOM=valeur;...), posées avant la création de Vulkan.
 # NVK_SWITCH_ZCULL=0 : test du blocage GPU au chargement de la ville (2026-09-30).
-# Mettre "" pour revenir au comportement normal (ZCULL actif).
+# "NVK_SWITCH_ZCULL=1" pour l'activer ("" ne suffit pas : la valeur par défaut du .nro reprendrait la main).
 mesa_env = "NVK_SWITCH_ZCULL=0"
 
 # Lectures de pak.zip (140 Mo, lu par tout petits morceaux dispersés) : cache en RAM par blocs de 64 Ko (32 Mo,
@@ -41,12 +41,37 @@ nfsmw_io_rangos_mb = 0
 # 1 = mis de côté puis en série (validation), 2 = en parallèle (défaut). Particules équivalentes, pas identiques.
 # torchlight_particules = 0
 
+# GPU en mode portable (src/torchlight_boost.cpp) : profil officiel du système, pas un surcadençage ; 0 = ne rien changer,
+# 384 ou 460 (défaut). Mémoire inchangée (sinon GPU laissé tel quel), rien en dock. Consomme plus de batterie.
+# torchlight_gpu_mhz = 0
+
+# Interface (fin de src/torchlight_ogre_natif.cpp) : 0 = comme le jeu ; 1 = les fenêtres qui ne sont pas dessinées ne demandent plus
+# de reconstruction en bougeant ; 2 = validation (reconstruite à chaque image, comparée à l'octet) ; 3 = reconstruction seulement si
+# une fenêtre dessinée a changé (défaut).
+# torchlight_interface = 0
+
 # Mode boost du processeur (FastLoad du système : processeur à 1785 MHz, GPU au minimum) pendant les chargements,
 # quand le jeu ne finit plus ses images (src/torchlight_boost.cpp) : vrai par défaut.
 # torchlight_boost_chargement = false
 
 # SetStreamSource et SetIndices du Direct3D du jeu sautés en rendu natif seul (vrai par défaut).
 # torchlight_natif_liaisons = false
+
+# Un cœur réservé au thread principal du jeu (src/torchlight_coeurs.cpp) : -1 = aucun, 1 ou 2 (éviter le 0, où le thread
+# de sortie audio est épinglé).
+torchlight_coeur_principal = 2
+# Sommets des billboards à la fin du parcours de l'octree (src/torchlight_particules.cpp) : 0 = comme le jeu, 2 = en parallèle.
+torchlight_billboards = 2
+# Poses des squelettes (src/torchlight_poses.cpp) : torchlight_poses : 0 = comme le jeu, 2 = précalculées en parallèle au
+# début de la boucle des unités ; torchlight_poses_double : pose de la seconde instance du familier évitée.
+torchlight_poses = 2
+torchlight_poses_double = true
+
+# Essais : réglages qui changent toutes les 7 s, un seul à la fois, pour comparer dans la même session (analyse :
+# switch/tools/ab_coeurs.py ; avec -DTORCHLIGHT_NATIVES_FIXES=OFF pour les natives). torchlight_alterner_ms : durée d'une
+# fenêtre de mesure « [coeurs] », 2000 pour switch/tools/ab_absolu.py.
+# torchlight_alterner = "poses,billboards,double"
+# torchlight_alterner_ms = 2000
 
 [log.levels]
 # Le jeu essaie plusieurs chemins pour chaque fichier (game:\music\..., game:\programs\...) :
