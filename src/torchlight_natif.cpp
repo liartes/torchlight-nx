@@ -747,7 +747,7 @@ void* CompileThreadMain(void*) {
     }
     if (job.task)
       job.task();
-    else
+    else if (!g_compiler->InCache(job.name))  // déjà en cache (cas courant) : rien à compiler ni à annoncer
       CompileNow(job);
   }
   return nullptr;
@@ -840,12 +840,16 @@ void ShaderSource(uint64_t hash, const std::string& profile, const std::string& 
   if (!g_compiler) return;
   char name[160];
   std::snprintf(name, sizeof(name), "%016llx_%s_%s", (unsigned long long)hash, profile.c_str(), entry.c_str());
-  if (g_compiler->InCache(name)) return;
-  CompileJob job{name, source, profile.rfind("vs", 0) == 0, d3dx_flags};
+  // Avec le thread de compilation, la vérification du cache se fait aussi là-bas : InCache (pack::Valid) ouvre le .tlsh
+  // sur la carte SD, lit son en-tête, va à la fin et le ferme. Faite ici, sur le thread principal du jeu, elle pesait
+  // 4,6 % des images longues (relevé du 2026-11-04 20:03), à l'arrivée dans une zone, pour des shaders déjà en cache.
+  // Le résultat ne sert pas ici : le rendu lit le .tlsh lui-même quand un dessin en a besoin.
   if (!g_compile_thread) {
-    CompileNow(job);  // pas de thread de compilation : sur le thread du jeu
+    if (g_compiler->InCache(name)) return;
+    CompileNow(CompileJob{name, source, profile.rfind("vs", 0) == 0, d3dx_flags});  // sur le thread du jeu
     return;
   }
+  CompileJob job{name, source, profile.rfind("vs", 0) == 0, d3dx_flags};
   {
     std::lock_guard<std::mutex> lock(g_queue_mutex);
     g_queue.push_back(std::move(job));

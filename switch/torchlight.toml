@@ -25,6 +25,10 @@ nfsmw_io_ventana_kb = 0
 nfsmw_io_cache_mb = 64
 nfsmw_io_cache_bloque_kb = 64
 nfsmw_io_rangos_mb = 0
+# Lecture en avance d'un bloc par un thread à part (2026-11-05) : après chaque bloc lu sur la SD, et à la première
+# utilisation d'un bloc lu en avance, le bloc suivant du même fichier. Trace du PC : 60 % des blocs manquants
+# évités. 0 pour couper.
+nfsmw_io_cache_anticipa = 1
 
 # Langue du jeu : par défaut celle de la console (français, allemand, espagnol ; toute autre langue : anglais).
 # Pour la forcer : 1 anglais, 3 allemand, 4 français, 5 espagnol.

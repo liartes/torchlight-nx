@@ -159,6 +159,7 @@ class TorchlightApp : public rex::ReXApp {
     SetDefault("nfsmw_io_cache_mb", "64");
     SetDefault("nfsmw_io_cache_bloque_kb", "64");
     SetDefault("nfsmw_io_rangos_mb", "0");
+    SetDefault("nfsmw_io_cache_anticipa", "1");
     // Langue du jeu (XGetLanguage du SDK lit user_language) : celle de la console, si le jeu la propose, sauf si
     // torchlight.toml la fixe, même à 1 (anglais, la valeur par défaut : d'où le test de la source, pas de la valeur).
     if (const auto* info = rex::cvar::GetFlagInfo("user_language");
