@@ -26,6 +26,8 @@
 #include <cstring>
 #include <vector>
 
+#include "torchlight_fmadds.h"
+
 REXCVAR_DEFINE_INT32(torchlight_donnees_natif, 1, "Torchlight",
                      "Primitives du chargement des données en C++ natif : 0 = recompilé, 1 = natif, 2 = valider")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -670,4 +672,168 @@ REX_HOOK_RAW(sub_824EE860) {
   }
   base[L32(base, piste + 20) + 120] = 1;
   ctx.r3.u64 = image;
+}
+
+// --- Mélange des textures d'équipement (boucle de sub_822DC6B0, d'après torchlight-recomp de YaPeL,
+// src/hooks/wardrobe_blend*.{h,cpp}, GPL-3.0) ---
+//
+// La construction d'une texture d'équipement mélange l'image de chaque objet dans celle du personnage, pixel par pixel :
+// unpackColour de l'objet ; alpha à 255, packColour tel quel ; sinon unpackColour du fond, mélange en simple précision,
+// fctidz de chaque canal, packColour. switch/tools/melange_natif.py insère, après « rotlwi r26,r10,0 » @0x822DD21C
+// (lignes déjà non nulles), « if (torchlight_melange(...)) goto loc_822DD39C; » et, à loc_822DD39C, l'appel de
+// torchlight_melange_fin (validation). Vrai : toute la boucle faite ici, état laissé comme la boucle le laisse ; faux :
+// la boucle recompilée.
+//
+// Ce que la suite de sub_822DC6B0 lit de la boucle (analyse de torchlight-recomp, tools/wardrobe_blend/
+// check_generated.py, sur les mêmes instructions du jeu) : r26 (mis à 0) ; r28 à r31, cr0, cr6, xer jamais lus avant
+// d'être réécrits (laissés quand même comme la boucle : r28 = 0, r29 et r31 avancés, r30 l'alpha du dernier pixel) ; les
+// temporaires de la pile, écrits ici comme la dernière itération les laisse ; les registres volatils : la dernière
+// instruction avant la sortie est un appel (packColour), après lequel rien n'en est lu (ABI du PowerPC).
+// Calculs dans l'ordre du code généré (@0x822DD288..0x822DD36C), fmadds par TorchlightFmadds (comme
+// switch/tools/fmadds_simples.py), fctidz comme le générateur ; fichier compilé avec -ffp-contract=off.
+// Option torchlight_melange_natif : 0 boucle recompilée, 1 native (défaut), 2 validation (native sur l'image puis
+// remise en état, boucle recompilée, comparaison des pixels et des temporaires à loc_822DD39C).
+REXCVAR_DEFINE_INT32(torchlight_melange_natif, 1, "Torchlight",
+                     "Equipment texture blend loop on the host: 0 recompiled, 1 native, 2 validation");
+
+namespace {
+
+inline double Simple(double x) { return double(float(x)); }
+
+// fctidz du code généré : NaN -> INT64_MIN, au-dessus de LLONG_MAX -> LLONG_MAX, sinon troncature (sous -2^63 :
+// INT64_MIN, comme cvttsd2si que le générateur émule).
+inline int64_t Fctidz(double x) {
+  if (x != x) return INT64_MIN;
+  if (x > double(INT64_MAX)) return INT64_MAX;
+  if (x < -9223372036854775808.0) return INT64_MIN;
+  return int64_t(x);
+}
+
+struct Validation {
+  bool attente = false;
+  uint32_t sp = 0, pixels = 0, octets = 0;
+  std::vector<uint8_t> image, pile;  // résultats de la native
+  uint64_t appels = 0, differences = 0;
+};
+thread_local Validation t_val;
+
+constexpr uint32_t kPileDebut = 128, kPileFin = 608;  // temporaires de la boucle : r1+128 .. r1+607
+
+// La boucle pour une image d'objet ; faux si un format n'est pas en ordre natif (la boucle recompilée le fait).
+bool Melanger(PPCContext& ctx, uint8_t* base, uint32_t sp, uint32_t lignes, uint32_t& objet, uint32_t& fond,
+              uint32_t& dernier_alpha, uint32_t f_objet, uint32_t f_fond, uint32_t r17, double un, double echelle) {
+  const uint32_t colonnes = L32(base, sp + 140);
+  const uint32_t d_objet = kFormats + f_objet * 44, d_fond = kFormats + f_fond * 44;
+  const uint32_t dr_objet = L32(base, d_objet + 8), dr_fond = L32(base, d_fond + 8);
+  if (!(dr_objet & 0x10) || !(dr_fond & 0x10)) return false;
+  const uint32_t n_fond = base[d_fond + 4];
+  uint8_t c[4] = {}, b[4] = {};
+  bool melange = false, dernier_melange = false;
+  uint64_t d_ig = 0, d_ia = 0, d_ib = 0, d_ir = 0, d_bg = 0, d_bb = 0, d_br = 0;
+  int64_t rouge = 0;
+  uint8_t r8 = 0, g8 = 0, b8 = 0;
+  for (uint32_t l = 0; l < lignes; l++) {
+    for (uint32_t k = 0; k < colonnes; k++, objet += 4, fond += 4) {
+      Deballer(base, d_objet, dr_objet, objet, c);
+      dernier_alpha = c[3];
+      if (c[3] >= 255) {
+        IntWrite(base, fond, n_fond, Emballer(base, d_fond, c[0], c[1], c[2], c[3]));
+        dernier_melange = false;
+        continue;
+      }
+      if (!melange) ctx.fpscr.disableFlushMode();
+      melange = dernier_melange = true;
+      Deballer(base, d_fond, dr_fond, fond, b);
+      d_ig = c[1], d_ia = uint64_t(int64_t(int32_t(c[3]))), d_ib = c[2], d_ir = c[0];
+      d_bg = b[1], d_bb = b[2], d_br = b[0];
+      const double alpha = Simple(Simple(double(int64_t(d_ia))) * echelle);  // fcfid, frsp, fmuls f4
+      const double ag = Simple(double(int64_t(d_ig))), ab = Simple(double(int64_t(d_ib)));
+      const double ar = Simple(double(int64_t(d_ir)));
+      const double bg = Simple(double(int64_t(d_bg))), br = Simple(double(int64_t(d_br)));
+      const double bb = Simple(double(int64_t(d_bb)));
+      const double inv = Simple(un - alpha);                                   // fsubs f10
+      const double ag_a = Simple(ag * alpha), ab_a = Simple(ab * alpha), ar_a = Simple(ar * alpha);
+      const double vert = torchlight::TorchlightFmadds(bg, inv, ag_a);         // fmadds f2
+      const double bleu = torchlight::TorchlightFmadds(bb, inv, ab_a);         // fmadds f0
+      const double rouge_d = torchlight::TorchlightFmadds(br, inv, ar_a);      // fmadds f12
+      g8 = uint8_t(Fctidz(vert));
+      b8 = uint8_t(Fctidz(bleu));
+      rouge = Fctidz(rouge_d);
+      r8 = uint8_t(rouge);
+      IntWrite(base, fond, n_fond, Emballer(base, d_fond, r8, g8, b8, 255));
+    }
+  }
+  // Temporaires de la pile, comme la dernière itération les laisse.
+  auto s64 = [&](uint32_t off, uint64_t v) {
+    for (int i = 0; i < 8; i++) base[sp + off + i] = uint8_t(v >> (56 - 8 * i));
+  };
+  if (lignes && colonnes) {
+    if (dernier_melange) {
+      base[sp + 129] = r8, base[sp + 130] = g8, base[sp + 128] = b8, base[sp + 131] = uint8_t(r17);
+    } else {
+      base[sp + 129] = c[0], base[sp + 130] = c[1], base[sp + 128] = c[2], base[sp + 131] = c[3];
+    }
+  }
+  if (melange) {
+    base[sp + 152] = b[0], base[sp + 145] = b[1], base[sp + 144] = b[2], base[sp + 288] = b[3];
+    s64(384, d_ig), s64(336, d_ia), s64(592, d_ib), s64(304, d_ir);
+    s64(600, d_bg), s64(528, d_bb), s64(296, d_br), s64(192, uint64_t(rouge));
+  }
+  return true;
+}
+
+}  // namespace
+
+// Appelée par le code généré (switch/tools/melange_natif.py) avec les registres de la boucle.
+// Valeurs des registres en entrée (pas de références : les variables du code généré restent en registres) ; vrai :
+// sortie[0] = r29, sortie[1] = r31, sortie[2] = r30, sortie[3] = colonnes non nulles (r28 alors à 0), r26 à 0.
+bool torchlight_melange(PPCContext& ctx, uint8_t* base, uint32_t r26, uint32_t r29, uint32_t r30, uint32_t r31,
+                        uint32_t r27, uint32_t r19, uint32_t r17, double f30, double f31, uint32_t* sortie) {
+  static const int mode = REXCVAR_GET(torchlight_melange_natif);
+  if (mode == 0 || r26 == 0) return false;
+  const uint32_t sp = ctx.r1.u32, lignes = r26, colonnes = L32(base, sp + 140);
+  if (mode == 2) {
+    // Native sur l'image et la pile, résultats gardés, puis remise en état : la boucle recompilée refait le travail et
+    // torchlight_melange_fin compare. Les pixels du fond sont contigus (r31 avance de 4 par pixel).
+    Validation& v = t_val;
+    const uint64_t octets = uint64_t(lignes) * colonnes * 4;
+    if (octets > (64u << 20)) return false;
+    std::vector<uint8_t> image(base + r31, base + r31 + octets), pile(base + sp + kPileDebut, base + sp + kPileFin);
+    uint32_t objet = r29, fond = r31, alpha = r30;
+    const uint32_t csr = ctx.fpscr.csr;
+    if (!Melanger(ctx, base, sp, lignes, objet, fond, alpha, r27, r19, r17, f30, f31)) return false;
+    // Mode flottant remis comme avant (la copie et le registre de l'hôte) : la boucle recompilée le change elle-même.
+    ctx.fpscr.csr = csr;
+    ctx.fpscr.setcsr(csr);
+    v.image.assign(base + r31, base + r31 + octets);
+    v.pile.assign(base + sp + kPileDebut, base + sp + kPileFin);
+    std::memcpy(base + r31, image.data(), octets);
+    std::memcpy(base + sp + kPileDebut, pile.data(), pile.size());
+    v.attente = true, v.sp = sp, v.pixels = r31, v.octets = uint32_t(octets);
+    return false;
+  }
+  uint32_t objet = r29, fond = r31, alpha = r30;
+  if (!Melanger(ctx, base, sp, lignes, objet, fond, alpha, r27, r19, r17, f30, f31)) return false;
+  sortie[0] = objet, sortie[1] = fond, sortie[2] = alpha, sortie[3] = colonnes != 0;
+  return true;
+}
+
+void torchlight_melange_fin(PPCContext& ctx, uint8_t* base) {
+  Validation& v = t_val;
+  if (!v.attente) return;
+  v.attente = false;
+  bool egal = v.sp == ctx.r1.u32 && std::memcmp(base + v.pixels, v.image.data(), v.octets) == 0;
+  // La pile : seuls les temporaires que la boucle écrit (les autres octets de la plage ne bougent pas).
+  egal = egal && std::memcmp(base + v.sp + kPileDebut, v.pile.data(), v.pile.size()) == 0;
+  v.appels++;
+  if (!egal && v.differences++ < 8) {
+    uint32_t premier = 0;
+    while (premier < v.octets && base[v.pixels + premier] == v.image[premier]) premier++;
+    uint32_t p = 0;
+    while (p < v.pile.size() && base[v.sp + kPileDebut + p] == v.pile[p]) p++;
+    REXLOG_ERROR("[melange natif] différence : image {:08X} ({} octets, premier écart à {}), pile premier écart à r1+{}",
+                 v.pixels, v.octets, premier, p < v.pile.size() ? kPileDebut + p : 0);
+  }
+  if (v.appels == 1 || v.appels % 64 == 0 || !egal)
+    REXLOG_INFO("[melange natif] validation : {} images, {} différences", v.appels, v.differences);
 }

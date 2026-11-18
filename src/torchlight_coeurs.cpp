@@ -30,6 +30,9 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#ifdef TORCHLIGHT_COMPTE_FPCR
+#include <rex/ppc/context.h>
+#endif
 
 REXCVAR_DEFINE_INT32(torchlight_coeur_principal, -1, "Torchlight",
                      "Essai : cœur réservé au thread principal du jeu (0 à 2 ; -1 = aucun) (Switch)")
@@ -343,6 +346,26 @@ void Lire() {
 }  // namespace
 
 void Image(size_t dessins, double image_ms, double attente_ms, double releve_ms, double textures_ms) {
+#ifdef TORCHLIGHT_COMPTE_FPCR
+  // Essai (build switch/out-fpcr, copie du SDK) : écritures du mode flottant par le thread principal, par image.
+  {
+    static uint64_t images = 0, dessins_total = 0, base[6] = {};
+    images++;
+    dessins_total += dessins;
+    if (images == 300) {
+      const uint64_t v[6] = {rex::ppc::g_compte_fpcr[0], rex::ppc::g_compte_fpcr[1], rex::ppc::g_compte_fpcr[2],
+                             rex::ppc::g_compte_fpcr[3], rex::ppc::g_compte_fpcr[4], rex::ppc::g_compte_fpcr_tests};
+      double d[6];
+      for (int i = 0; i < 6; i++) d[i] = double(v[i] - base[i]) / double(images);
+      REXLOG_INFO("[fpcr] par image ({} dessins) : écritures {:.0f} (disable {:.0f}, enable {:.0f}, incond. enable {:.0f}, "
+                  "incond. disable {:.0f}, arrondi {:.0f}) ; tests {:.0f}",
+                  dessins_total / images, d[0] + d[1] + d[2] + d[3] + d[4], d[0], d[1], d[2], d[3], d[4], d[5]);
+      for (int i = 0; i < 6; i++) base[i] = v[i];
+      images = 0;
+      dessins_total = 0;
+    }
+  }
+#endif
   if (!g_lu) Lire();
   if (!g_actif) return;
 

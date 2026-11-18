@@ -75,6 +75,18 @@ python3 "$HERE/tools/atomiques_sans_verrou.py"
 # Boucle des particules de BillboardRenderer::_updateRenderQueue séparable (switch/tools/billboards_differes.py) : après
 # toutes les autres étapes, elle en recopie le texte final.
 python3 "$HERE/tools/billboards_differes.py"
+# fmadds / fmsubs / fnmadds / fnmsubs arrondies une seule fois, comme le Xenon (switch/tools/fmadds_simples.py, d'après
+# le port 96 de renut_nx_ultimate_base) ; les natives prennent la même forme (src/torchlight_fmadds.h).
+python3 "$HERE/tools/fmadds_simples.py"
+# Celles dont les trois entrées sont prouvées simples, sans le test (switch/tools/fmadds_prouvees.py ; vérification à
+# l'exécution sur PC : -DTORCHLIGHT_VERIF_SIMPLES=ON).
+python3 "$HERE/tools/fmadds_prouvees.py"
+# stvewx / stvehx : la lane lue dans le registre, sans aller-retour par la pile (switch/tools/lanes_registre.py, d'après
+# le port 85 de renut_nx_ultimate_base ; test : switch/tools/test_lanes_registre.py).
+python3 "$HERE/tools/lanes_registre.py"
+# Boucle du mélange des textures d'équipement de sub_822DC6B0 faite par l'hôte (switch/tools/melange_natif.py,
+# torchlight_melange de src/torchlight_donnees_natif.cpp, d'après torchlight-recomp) : idempotent.
+python3 "$HERE/tools/melange_natif.py"
 # Mémoire du jeu sans volatile (switch/tools/memoire_non_volatile.py) : essayée le 2026-11-01, pas de gain sur la
 # console (ville ~2 % plus lente) ; étape retirée, outil gardé (à relancer en dernier, avec
 # -DTORCHLIGHT_MEMOIRE_NON_VOLATILE=ON, puis switch/tools/boucles_infinies.py sur l'ELF).

@@ -570,9 +570,12 @@ void BillboardsFin(PPCContext& ctx, uint8_t* base) {
     g_bb_ordre.resize(g_bb_nombre);
     for (size_t i = 0; i < g_bb_nombre; i++) g_bb_ordre[i] = uint32_t(i);
     if (ModeBB() == 2) {
-      // Les plus longues d'abord : moins d'attente de la dernière.
-      std::stable_sort(g_bb_ordre.begin(), g_bb_ordre.end(),
-                       [](uint32_t a, uint32_t b) { return g_bb[a].cout > g_bb[b].cout; });
+      // Les plus longues d'abord : moins d'attente de la dernière. À égalité, par rang : le même ordre que l'ancien
+      // std::stable_sort, sans son tampon alloué à chaque image (operator new sur le thread principal, relevé du
+      // 2026-11-04).
+      std::sort(g_bb_ordre.begin(), g_bb_ordre.end(), [](uint32_t a, uint32_t b) {
+        return g_bb[a].cout != g_bb[b].cout ? g_bb[a].cout > g_bb[b].cout : a < b;
+      });
       LeGroupe().Lancer(ctx, base, g_bb_nombre, FaireBoucle);
     } else {
       for (size_t i = 0; i < g_bb_nombre; i++) {

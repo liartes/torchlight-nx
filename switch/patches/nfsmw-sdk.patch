@@ -12,6 +12,37 @@ index 8200139..81cb652 100644
    std::vector<uint32_t> exceptionHandlerFuncHints;  ///< Additional exception handler addresses
  
    /**
+diff --git a/sdk/include/rex/filesystem/devices/host_path_file.h b/sdk/include/rex/filesystem/devices/host_path_file.h
+index 5a6120e..59accdd 100644
+--- a/sdk/include/rex/filesystem/devices/host_path_file.h
++++ b/sdk/include/rex/filesystem/devices/host_path_file.h
+@@ -87,6 +87,8 @@ class HostPathFile : public File {
+                      size_t* out_bytes_written) override;
+   X_STATUS SetLength(size_t length) override;
+   X_STATUS Flush() override;
++  bool CloseHostHandleForRename() override;
++  bool ReopenHostHandleAfterRename() override;
+ 
+  private:
+   /*
+diff --git a/sdk/include/rex/filesystem/file.h b/sdk/include/rex/filesystem/file.h
+index 4caf6f4..ad78b93 100644
+--- a/sdk/include/rex/filesystem/file.h
++++ b/sdk/include/rex/filesystem/file.h
+@@ -61,6 +61,13 @@ class File {
+   // read-only ones) just report success; the one that matters is the host disk device.
+   virtual X_STATUS Flush() { return X_STATUS_SUCCESS; }
+ 
++  // torchlight : renommage d'un fichier ouvert. La Switch refuse de renommer un fichier ouvert, ce que les jeux Xbox
++  // font (Torchlight écrit save.tmp puis le renomme par NtSetInformationFile sur son handle). XFile::Rename ferme le
++  // descripteur de l'hôte avant le renommage et le rouvre après, sous le nouveau nom : faux pour les fichiers sans
++  // descripteur à fermer (rien n'est fait).
++  virtual bool CloseHostHandleForRename() { return false; }
++  virtual bool ReopenHostHandleAfterRename() { return true; }
++
+   // rex::filesystem::FileAccess
+   uint32_t file_access() const { return file_access_; }
+   const Entry* entry() const { return entry_; }
 diff --git a/sdk/include/rex/graphics/command_processor.h b/sdk/include/rex/graphics/command_processor.h
 index da8e432..53eb878 100644
 --- a/sdk/include/rex/graphics/command_processor.h
@@ -27,6 +58,23 @@ index da8e432..53eb878 100644
  
    // Some titles submit writes beyond the emulated register file range in PM4
    // packets. Preserve these values so dependent packet logic can still observe
+diff --git a/sdk/include/rex/ppc/context.h b/sdk/include/rex/ppc/context.h
+index 0ede542..c7467fd 100644
+--- a/sdk/include/rex/ppc/context.h
++++ b/sdk/include/rex/ppc/context.h
+@@ -174,6 +174,12 @@ struct FPSCRRegister {
+   inline void storeFromGuest(uint32_t value) noexcept {
+     csr &= ~RoundMaskVal;
+     csr |= Platform::GuestToHost[value & kRoundMask];
++    // torchlight (port 140 de renut_nx_ultimate_base, blur-nx) : l'écriture (msr fpcr, des dizaines de cycles sur
++    // l'A57) est sautée quand le registre de l'hôte, relu (mrs, pas la copie csr, qu'une restauration de contexte peut
++    // changer sans l'écrire), vaut déjà ce qu'on écrirait. Exact. REX_FPSCR_WRITE_ALWAYS : écriture à chaque fois.
++#if !defined(REX_FPSCR_WRITE_ALWAYS)
++    if (uint32_t(getcsr()) == csr) return;
++#endif
+     setcsr(csr);
+   }
+ 
 diff --git a/sdk/include/rex/system/xmemory.h b/sdk/include/rex/system/xmemory.h
 index 0c39a42..9370463 100644
 --- a/sdk/include/rex/system/xmemory.h
@@ -843,10 +891,16 @@ index 8b903f0..7f21f78 100644
                  rex::path_to_utf8(host_path_), rex::path_to_utf8(new_host_path), ec.message());
      return X_STATUS_ACCESS_DENIED;
 diff --git a/sdk/src/filesystem/devices/host_path_file.cpp b/sdk/src/filesystem/devices/host_path_file.cpp
-index 15e12ce..5a1dd0f 100644
+index 15e12ce..b0d989e 100644
 --- a/sdk/src/filesystem/devices/host_path_file.cpp
 +++ b/sdk/src/filesystem/devices/host_path_file.cpp
-@@ -14,17 +14,27 @@
+@@ -9,22 +9,33 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
  
  #include <algorithm>
  #include <atomic>
@@ -874,7 +928,7 @@ index 15e12ce..5a1dd0f 100644
  
  /*
   * Size of the read-ahead window, in KB. 0 turns it off.
-@@ -113,6 +123,38 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
+@@ -113,6 +124,38 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
                       "Cache en RAM de lo ya leido del disco, en MB (0 = apagada). Solo datos de solo "
                       "lectura. El juego relee cada vuelta lo mismo.");
  
@@ -913,7 +967,7 @@ index 15e12ce..5a1dd0f 100644
  /*
   * Read cache by exact range. This is the second attempt, not the block cache above.
   *
-@@ -197,12 +239,17 @@ std::atomic<int64_t> g_ventanas_vivas{0};
+@@ -197,12 +240,17 @@ std::atomic<int64_t> g_ventanas_vivas{0};
  // Above this it does not pay off: the request is already large and the window would only add an extra copy.
  constexpr size_t kPeticionMaxFraccion = 4;  // pedido <= ventana/4
  
@@ -934,7 +988,7 @@ index 15e12ce..5a1dd0f 100644
  };
  
  std::mutex g_cache_mutex;
-@@ -251,122 +298,332 @@ void PodarCache(size_t limite) {
+@@ -251,122 +299,332 @@ void PodarCache(size_t limite) {
  }
  
  /*
@@ -1291,21 +1345,21 @@ index 15e12ce..5a1dd0f 100644
 -                    "del disco como antes",
 -                    tenia);
 -        return false;
--      }
++        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga");
+       }
 -      PodarCache(limite);
 -      it = g_cache.find(clave);  // the insertion may have rebuilt the table
 -      if (it == g_cache.end()) {
 -        break;  // not even the first block had bytes: end of file
-+        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga");
-       }
+-      }
 -    } else {
 -      ++g_cache_aciertos;
 -      TocarBloque(clave, it->second);
--    }
+     }
 -    const size_t dentro = byte_offset + copiados - static_cast<size_t>(b * kBloqueCache);
 -    if (dentro >= it->second.datos.size()) {
 -      break;  // the block ends before the requested range: end of file
-     }
+-    }
 -    const size_t n = std::min(it->second.datos.size() - dentro, pedido - copiados);
 -    std::memcpy(buffer.data() + copiados, it->second.datos.data() + dentro, n);
 -    copiados += n;
@@ -1342,6 +1396,29 @@ index 15e12ce..5a1dd0f 100644
    }
    return true;
  }
+@@ -651,6 +909,22 @@ X_STATUS HostPathFile::Flush() {
+   return X_STATUS_SUCCESS;
+ }
+ 
++// torchlight : voir File::CloseHostHandleForRename. Le FileHandle lit et écrit à des positions données (pread /
++// pwrite) : aucune position à garder entre la fermeture et la réouverture. Les fenêtres et caches de lecture ne
++// concernent que les fichiers en lecture seule, jamais renommés.
++bool HostPathFile::CloseHostHandleForRename() {
++  if (!file_handle_) return false;
++  file_handle_.reset();
++  return true;
++}
++
++bool HostPathFile::ReopenHostHandleAfterRename() {
++  auto* e = static_cast<HostPathEntry*>(entry());
++  file_handle_ = rex::filesystem::FileHandle::OpenExisting(
++      e->host_path(), file_access(), static_cast<HostPathDevice*>(e->device())->allow_share_delete());
++  return file_handle_ != nullptr;
++}
++
+ bool HostPathFile::RellenarVentana(size_t byte_offset, size_t pedido, std::span<uint8_t> buffer,
+                                    size_t* out_bytes_read, X_STATUS* out_status) {
+   if (ventana_.size() != ventana_tam_) {
 diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_processor.cpp
 index f80e13a..20d39eb 100644
 --- a/sdk/src/graphics/command_processor.cpp
@@ -1828,6 +1905,60 @@ index 57fd161..9427c88 100644
  REX_EXPORT(__imp__KeTlsSetValue, rex::kernel::xboxkrnl::KeTlsSetValue_entry)
  REX_EXPORT(__imp__KeInitializeEvent, rex::kernel::xboxkrnl::KeInitializeEvent_entry)
  REX_EXPORT(__imp__KeSetEvent, rex::kernel::xboxkrnl::KeSetEvent_entry)
+diff --git a/sdk/src/system/kernel_state.cpp b/sdk/src/system/kernel_state.cpp
+index 697399c..034b272 100644
+--- a/sdk/src/system/kernel_state.cpp
++++ b/sdk/src/system/kernel_state.cpp
+@@ -43,9 +43,16 @@
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtimer.h>
+ 
+-namespace rex::system {
++// torchlight (port 143 de renut_nx_ultimate_base, tw2de_nx) : Xenia attend 100 ms avant chaque appel XAM différé
++// (XamContentCreateEx avec OVERLAPPED, XamEnumerate, fenêtres XamShow*). 0 par défaut : l'appel reste asynchrone (thread
++// de répartition) mais sans attente. Il faut alors la remise à zéro de l'événement au départ de l'opération (comme le
++// noyau de la Xbox) : sans le délai, un signal resté de l'opération précédente terminait trop tôt l'attente suivante.
++REXCVAR_DEFINE_INT32(kernel_deferred_overlapped_delay_ms, 0, "Kernel",
++                     "Delay in ms before each deferred XAM overlapped call completes (Xenia: 100). 0: none.");
++REXCVAR_DEFINE_BOOL(kernel_overlapped_reset_event, true, "Kernel",
++                    "Reset the overlapped event when a deferred XAM operation starts (needed with no delay).");
+ 
+-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
++namespace rex::system {
+ 
+ // This is a global object initialized with the XboxkrnlModule.
+ // It references the current kernel state object that all kernel methods should
+@@ -1220,6 +1227,14 @@ void KernelState::CompleteOverlappedDeferredEx(
+   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
++  static const bool reset_event = REXCVAR_GET(kernel_overlapped_reset_event);
++  if (reset_event) {
++    if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
++      if (auto ev = object_table()->LookupObject<XEvent>(event_handle)) {
++        ev->Reset();
++      }
++    }
++  }
+   auto global_lock = global_critical_region_.Acquire();
+   dispatch_queue_.push_back(
+       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
+@@ -1227,9 +1242,12 @@ void KernelState::CompleteOverlappedDeferredEx(
+         if (pre_callback) {
+           pre_callback();
+         }
+-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
+-                     kDeferredOverlappedDelayMillis);
+-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
++        static const int32_t delay_ms = REXCVAR_GET(kernel_deferred_overlapped_delay_ms);
++        // torchlight : une ligne par appel différé (quelques-uns par sauvegarde au plus), pour savoir si le jeu en fait.
++        REXSYS_INFO("[xam differe] overlapped {:08X} : attente de {} ms", overlapped_ptr, delay_ms);
++        if (delay_ms > 0) {
++          rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
++        }
+         uint32_t extended_error, length;
+         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
+         auto result = completion_callback(extended_error, length);
 diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
 index 78826a6..e9487ae 100644
 --- a/sdk/src/system/xam/content_manager.cpp
@@ -1915,10 +2046,29 @@ index 78826a6..e9487ae 100644
      return X_ERROR_ACCESS_DENIED;
    }
 diff --git a/sdk/src/system/xfile.cpp b/sdk/src/system/xfile.cpp
-index 4179e8b..708b7e5 100644
+index 4179e8b..e98cc5e 100644
 --- a/sdk/src/system/xfile.cpp
 +++ b/sdk/src/system/xfile.cpp
-@@ -37,7 +37,18 @@ XFile::XFile() : XObject(kObjectType) {
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -21,6 +22,10 @@
+ 
+ #include <span>
+ 
++REXCVAR_DEFINE_BOOL(fs_rename_closes_handle, true, "Filesystem",
++                    "Close the host file while renaming an open file, then reopen it (Switch refuses renaming open "
++                    "files; false: the old whole-file copy)");
++
+ namespace rex::system {
+ 
+ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
+@@ -37,7 +42,18 @@ XFile::XFile() : XObject(kObjectType) {
  XFile::~XFile() {
    // TODO(benvanik): signal that the file is closing?
    async_event_->Set();
@@ -1937,6 +2087,27 @@ index 4179e8b..708b7e5 100644
  }
  
  uint64_t XFile::position() const {
+@@ -292,7 +308,19 @@ X_STATUS XFile::SetLength(size_t length) {
+ 
+ X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
+   std::lock_guard<std::mutex> lock(file_lock_);
+-  return entry()->Rename(file_path);
++  // torchlight : descripteur de l'hôte fermé pendant le renommage (la Switch refuse de renommer un fichier ouvert ;
++  // sans cela, HostPathEntry copiait tout le fichier sous le nouveau nom à chaque sauvegarde), puis rouvert sous le
++  // nom qu'a alors l'entrée (le nouveau, ou l'ancien si le renommage a échoué).
++  static const bool fermer = REXCVAR_GET(fs_rename_closes_handle);
++  const bool ferme = fermer && file_->CloseHostHandleForRename();
++  const X_STATUS status = entry()->Rename(file_path);
++  if (ferme && !file_->ReopenHostHandleAfterRename()) {
++    REXSYS_ERROR("XFile::Rename: '{}' renommé mais impossible à rouvrir", rex::path_to_utf8(file_path));
++  } else if (ferme) {
++    REXSYS_INFO("[renommage] '{}' (fichier ouvert fermé puis rouvert) : {:08X}", rex::path_to_utf8(file_path),
++                uint32_t(status));
++  }
++  return status;
+ }
+ 
+ void XFile::RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port) {
 diff --git a/sdk/src/system/xmemory.cpp b/sdk/src/system/xmemory.cpp
 index 9ab905b..df70037 100644
 --- a/sdk/src/system/xmemory.cpp

@@ -14,7 +14,7 @@ project(torchlight LANGUAGES CXX)
 
 # Nom public du projet : torchlight-nx (portage non officiel ; menu homebrew, zip des joueurs). Version affichée par
 # le menu homebrew et nom du zip (switch/build_joueurs.sh).
-set(TORCHLIGHT_VERSION "1.0.5")
+set(TORCHLIGHT_VERSION "1.0.6")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -67,7 +67,7 @@ endif()
 
 # Décompression des fichiers du jeu par la zlib de l'hôte et lectures du zip en tampon (src/torchlight_inflate.cpp),
 # primitives du chargement des données en natif (src/torchlight_donnees_natif.cpp).
-target_sources(torchlight PRIVATE ../src/torchlight_inflate.cpp ../src/torchlight_donnees_natif.cpp)
+target_sources(torchlight PRIVATE ../src/torchlight_inflate.cpp ../src/torchlight_donnees_natif.cpp ../src/torchlight_fichiers_absents.cpp ../src/torchlight_attente_sauvegarde.cpp)
 target_link_libraries(torchlight PRIVATE z)
 
 # Code du .nro reprojeté en blocs de 2 Mo au démarrage (src/torchlight_code_blocs.cpp). Sans LTO : assembleur de premier niveau.
@@ -114,6 +114,13 @@ option(TORCHLIGHT_RETOUR_LR "Écrire l'adresse de retour dans ctx.lr avant chaqu
 if(TORCHLIGHT_RETOUR_LR AND TARGET torchlight_recomp)
     target_compile_definitions(torchlight_recomp PRIVATE REX_LR_STORES=1)
 endif()
+# Vérification à l'exécution des fmadds aux entrées prouvées simples (switch/tools/fmadds_prouvees.py ; essai sur PC) :
+# chaque site prouvé contrôle ses entrées (src/torchlight_fmadds.cpp, lignes « [fmadds prouvées] » du journal).
+option(TORCHLIGHT_VERIF_SIMPLES "Vérifier les preuves de fmadds_prouvees.py à l'exécution" OFF)
+target_sources(torchlight PRIVATE ../src/torchlight_fmadds.cpp)
+if(TORCHLIGHT_VERIF_SIMPLES AND TARGET torchlight_recomp)
+    target_compile_definitions(torchlight_recomp PRIVATE TORCHLIGHT_VERIF_SIMPLES=1)
+endif()
 
 if(REXGLUE_PLATFORM_SWITCH)
     # -fno-math-errno sur le code du jeu (comme sa2-nx) : sans lui, chaque racine carrée (fsqrt) est suivie d'un test
@@ -126,7 +133,9 @@ if(REXGLUE_PLATFORM_SWITCH)
     # Fonctions natives d'Ogre (validées au bit près sur PC, sans fma) : GCC contracte par défaut a * b + c en fma
     # (-ffp-contract=fast en mode GNU), ce qui changerait les arrondis sur la console ; les fma du jeu (fmadds)
     # y sont écrites explicitement (std::fma).
-    set_source_files_properties(../src/torchlight_ogre_natif.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+    # Même règle pour le mélange des textures d'équipement (torchlight_melange, src/torchlight_donnees_natif.cpp).
+    set_source_files_properties(../src/torchlight_ogre_natif.cpp ../src/torchlight_donnees_natif.cpp
+                                PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
     option(TORCHLIGHT_SANS_MATH_ERRNO "-fno-math-errno sur le code du jeu et le nôtre" ON)
     if(TORCHLIGHT_SANS_MATH_ERRNO)
         foreach(cible torchlight_recomp torchlight)

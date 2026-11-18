@@ -27,6 +27,7 @@
 #include <rex/system/xmemory.h>
 
 #include "torchlight_coeurs.h"
+#include "torchlight_fmadds.h"
 #include "torchlight_particules.h"
 #include "torchlight_poses.h"
 
@@ -133,7 +134,7 @@ bool BoxVisible(const uint8_t* base, uint32_t planes, uint32_t box) {
 
 // sub_821C2CC8(r3 résultat, r4 A, r5 B) : produit de matrices 4x4 d'Ogre (Matrix4::concatenate, lignes de A par
 // colonnes de B), rend r3. Opérations dans l'ordre du jeu et arrondies comme le code recompilé (fmuls :
-// float(a*b), fmadds : float(fma(a, b, c)) en double) : t = a1*b1, puis a0*b0, a2*b2, a3*b3 ajoutés par fma.
+// float(a*b), fmadds : TorchlightFmadds, arrondie une fois) : t = a1*b1, puis a0*b0, a2*b2, a3*b3 ajoutés par fma.
 // Appelé pour les paramètres automatiques et l'écouteur du RT Shader System ; console : 1 % en temps propre.
 void Concatenate(uint8_t* base, uint32_t out, uint32_t a, uint32_t b) {
   double m[16], n[16];
@@ -145,9 +146,9 @@ void Concatenate(uint8_t* base, uint32_t out, uint32_t a, uint32_t b) {
   for (int i = 0; i < 4; i++)
     for (int j = 0; j < 4; j++) {
       double t = double(float(m[4 * i + 1] * n[4 + j]));
-      t = double(float(std::fma(m[4 * i + 0], n[0 + j], t)));
-      t = double(float(std::fma(m[4 * i + 2], n[8 + j], t)));
-      t = double(float(std::fma(m[4 * i + 3], n[12 + j], t)));
+      t = double(float(torchlight::TorchlightFmadds(m[4 * i + 0], n[0 + j], t)));
+      t = double(float(torchlight::TorchlightFmadds(m[4 * i + 2], n[8 + j], t)));
+      t = double(float(torchlight::TorchlightFmadds(m[4 * i + 3], n[12 + j], t)));
       r[4 * i + j] = float(t);
     }
   for (int k = 0; k < 16; k++) {
@@ -239,9 +240,9 @@ float GuestFloatCall(PPCFunc* func, PPCContext& ctx, uint8_t* base, double x) {
   return float(ctx.f1.f64);
 }
 
-// fmadds / fmsubs du code recompilé : fma en double, arrondi en float.
-float FmaLikeGuest(float a, float b, float c) { return float(std::fma(double(a), double(b), double(c))); }
-float FmsLikeGuest(float a, float b, float c) { return float(std::fma(double(a), double(b), -double(c))); }
+// fmadds / fmsubs du code recompilé : arrondies une seule fois (torchlight_fmadds.h, switch/tools/fmadds_simples.py).
+float FmaLikeGuest(float a, float b, float c) { return float(torchlight::TorchlightFmadds(double(a), double(b), double(c))); }
+float FmsLikeGuest(float a, float b, float c) { return float(torchlight::TorchlightFmadds(double(a), double(b), -double(c))); }
 
 double LoadDouble(const uint8_t* base, uint32_t addr) {
   const uint64_t w = (uint64_t(Load32(base, addr)) << 32) | Load32(base, addr + 4);
@@ -513,7 +514,7 @@ uint32_t CallGuest(PPCContext& ctx, uint8_t* base, uint32_t func, uint32_t obj, 
 void StoreFloat(uint8_t* base, uint32_t addr, float f) { Store32(base, addr, FloatBits(f)); }
 
 float FnmsLikeGuest(float a, float b, float c) {  // fnmsubs : -(a * b - c)
-  return float(-std::fma(double(a), double(b), -double(c)));
+  return float(-torchlight::TorchlightFmadds(double(a), double(b), -double(c)));
 }
 
 void UpdateFromParent(PPCContext& ctx, uint8_t* base, uint32_t node);
@@ -1701,7 +1702,7 @@ bool TextExtent(PPCContext& ctx, uint8_t* base, uint32_t font, uint32_t text, do
     const uint32_t image = Load32(base, glyph);
     const float right = float(double(LoadFloat(base, image + 36) + LoadFloat(base, image + 28)) * scale) + x;
     if (right > extent) extent = right;
-    x = float(std::fma(double(LoadFloat(base, glyph + 4)), scale, double(x)));
+    x = float(torchlight::TorchlightFmadds(double(LoadFloat(base, glyph + 4)), scale, double(x)));
   }
   result = x < extent ? extent : x;
   return true;
@@ -7479,7 +7480,7 @@ REX_HOOK_RAW(sub_821EF7B8) {
     if (i < l * int32_t(Load32(base, self + 116)) && x >= 0 && y >= 0) return LoadFloat(base, Load32(base, self + 128) + uint32_t(i) * 4);
     return zero;
   };
-  auto avancer = [&](float v) { return float(std::fma(dt, double(vitesse), double(v))); };
+  auto avancer = [&](float v) { return float(torchlight::TorchlightFmadds(dt, double(vitesse), double(v))); };
   auto couleur_marqueur = [&](uint32_t objet, float a, float b) {
     StoreFloat(base, objet + 64, a);
     StoreFloat(base, objet + 68, a);
@@ -8068,7 +8069,7 @@ REX_HOOK_RAW(sub_821B8F00) {
           ctx.f1.f64 = double(z);
           sub_821BA438(ctx, base);
           ctx.fpscr.disableFlushMode();
-          x = float(std::fma(double(LoadFloat(base, glyphe + 4)), ex, double(x)));
+          x = float(torchlight::TorchlightFmadds(double(LoadFloat(base, glyphe + 4)), ex, double(x)));
         }
       }
       i++;
